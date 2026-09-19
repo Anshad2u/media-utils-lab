@@ -48,11 +48,13 @@ MIN_CHUNK_S = 1.0  # trailing fragments below this are dropped
 # taste. Two Groq accounts give 2 x 2,000 = 4,000 audio requests/day. The target
 # volume is ~300 h/month, which at a 10 minute cap is ~60 recordings/day. So the
 # allowance per recording is 4,000 / 60 = 66 calls, and with two candidate
-# languages that is 33 chunks - hence 32, leaving headroom for retries.
+# languages that is 33 chunks. The cap is 28 rather than 33 deliberately: running
+# at 96% of the allowance leaves nothing for retries or a burst, and the failure
+# mode when the quota runs out is severe - see below. 28 uses ~84%.
 # Raise this and the daily quota runs out mid-afternoon; the run then reports
 # every chunk as "Beary / other" because every call failed, which looks exactly
 # like a language-detection bug. The arithmetic above is the guard against that.
-MAX_CHUNKS = 32
+MAX_CHUNKS = 28
 CHUNK_PAUSE_S = 6.0  # two calls per chunk, paced under the free tier's 20 rpm
 TRANSCRIPT_LIMIT = 3500  # Telegram caps a message at 4096 characters
 
