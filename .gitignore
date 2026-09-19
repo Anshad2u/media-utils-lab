@@ -1,0 +1,24 @@
+# Media — never commit source or intermediate audio
+*.wav
+*.m4a
+*.mp3
+*.mp4
+*.ogg
+*.oga
+
+# Secrets / local environment
+.env*
+
+# Model weights and embeddings
+*.npy
+*.pt
+pretrained_models/
+
+# Tooling
+node_modules/
+.wrangler/
+
+# Python
+__pycache__/
+*.pyc
+.venv/

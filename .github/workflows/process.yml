@@ -1,0 +1,70 @@
+name: process
+
+# Only the dispatch sent by the relay and manual runs.
+# No pull_request / pull_request_target / fork-reachable triggers.
+on:
+  repository_dispatch:
+    types: [process_audio]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Queue instead of colliding. Never cancel a run that is mid-upload.
+  group: process-audio
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install ffmpeg
+        run: |
+          set +x
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Cache model weights
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            pretrained_models
+            ~/.cache/huggingface
+            ~/.cache/torch
+          key: models-ecapa-v1
+
+      - name: Install CPU-only torch
+        run: |
+          set +x
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet torch==2.2.2 torchaudio==2.2.2 \
+            --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        run: |
+          set +x
+          python -m pip install --quiet -r requirements.txt
+
+      - name: Process
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
+          VOICE_EMBEDDING: ${{ secrets.VOICE_EMBEDDING }}
+          MATCH_THRESHOLD: ${{ vars.MATCH_THRESHOLD }}
+          FILE_ID: ${{ github.event.client_payload.file_id }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          set +x
+          python process.py

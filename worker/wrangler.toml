@@ -1,0 +1,17 @@
+name = "media-utils-lab"
+main = "index.js"
+compatibility_date = "2025-01-15"
+workers_dev = true
+
+[vars]
+# Owner/name of the repository that receives the dispatch. Not a secret: the
+# repository is public, so its name is already visible.
+GITHUB_REPO = "OWNER/REPO"
+
+# Everything below is supplied at deploy time with `wrangler secret put <NAME>`
+# and is deliberately absent from this file:
+#
+#   TELEGRAM_BOT_TOKEN
+#   TELEGRAM_CHAT_ID
+#   TELEGRAM_WEBHOOK_SECRET
+#   GITHUB_DISPATCH_TOKEN
