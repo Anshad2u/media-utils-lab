@@ -41,8 +41,16 @@ GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3-turbo"
 CHUNK_S = 8.0  # short enough that a chunk rarely spans two languages
 MIN_CHUNK_S = 1.0  # trailing fragments below this are dropped
-MAX_CHUNKS = 80  # bounds the API calls one message can trigger (~10 min of speech)
-CHUNK_PAUSE_S = 7.0  # two calls per chunk, paced under the free tier's 20 rpm cap
+# Bounds the API calls one recording can trigger, and it is set by quota, not by
+# taste. Two Groq accounts give 2 x 2,000 = 4,000 audio requests/day. The target
+# volume is ~300 h/month, which at a 10 minute cap is ~60 recordings/day. So the
+# allowance per recording is 4,000 / 60 = 66 calls, and with three candidate
+# languages that is 22 chunks - hence 20, leaving headroom for retries.
+# Raise this and the daily quota runs out mid-afternoon; the run then reports
+# every chunk as "Beary / other" because every call failed, which looks exactly
+# like a language-detection bug. The arithmetic above is the guard against that.
+MAX_CHUNKS = 20
+CHUNK_PAUSE_S = 6.0  # three calls per chunk, paced under the free tier's 20 rpm
 TRANSCRIPT_LIMIT = 3500  # Telegram caps a message at 4096 characters
 
 # A chunk is transcribed once per candidate language, and the more confident
@@ -50,9 +58,21 @@ TRANSCRIPT_LIMIT = 3500  # Telegram caps a message at 4096 characters
 # the acoustic identifier handles a clean studio sample at 0.95 confidence and
 # still scatters a compressed voice note with an Indian accent across Tamil,
 # Telugu, Malayalam, Urdu and Assamese. The transcriber is far better at accented
-# speech, and the confidence tells us when neither language fits - which is what
-# Beary looks like to it.
-LANGUAGE_CANDIDATES = ("ar", "en")
+# speech, and the confidence tells us when none of the candidates fit - which is
+# what Beary looks like to it.
+#
+# These are the languages the user actually speaks that the model supports. Beary
+# is deliberately absent and must stay absent: the model has no Beary, so a
+# "beary" candidate cannot be passed and could never win a reading anyway. Beary
+# therefore falls through to OTHER_BUCKET by design, which is what we want - it
+# is labelled and left alone rather than forced into Arabic or English.
+#
+# Hindi was added because leaving it out was not neutral. A Hindi chunk had to be
+# forced into Arabic or English, and whichever won by the margin was reported as
+# real - so some of the Arabic figure was really Hindi. Adding the candidate lets
+# those chunks land correctly instead of inflating a language the user is
+# actually trying to measure.
+LANGUAGE_CANDIDATES = ("ar", "en", "hi")
 LANGUAGE_FLOOR = -0.80  # below this, the reading is not credible
 LANGUAGE_MARGIN = 0.15  # the winner must beat the runner-up by this much
 SILENCE_CEILING = 0.60  # no_speech_prob above this means there was nothing to read
@@ -67,7 +87,7 @@ REPETITION_FLOOR = 0.40  # unique-word ratio below this means the model was loop
 LID_WINDOW_S = 3.0
 LID_HOP_S = 1.5
 MIN_LID_S = 1.0
-LANGUAGE_BUCKETS = {"ar": "Arabic", "en": "English"}
+LANGUAGE_BUCKETS = {"ar": "Arabic", "en": "English", "hi": "Hindi"}
 OTHER_BUCKET = "Beary / other"
 
 # A Thai sample that ships with the language model. The self-test classifies it
@@ -309,7 +329,9 @@ def transcribe_mode() -> str:
 
 
 def groq_keys() -> list[str]:
-    """Both configured keys, primary first, so one running dry falls through."""
+    """Both configured keys. They belong to two separate Groq accounts, and Groq
+    meters per organisation, so each carries its own independent allowance.
+    read_chunk rotates between them rather than always starting at the first."""
     return [
         value
         for value in (
@@ -318,6 +340,10 @@ def groq_keys() -> list[str]:
         )
         if value
     ]
+
+
+# Rotates which account a call starts from. See read_chunk for why.
+_key_cursor = 0
 
 
 def read_chunk(keys: list[str], samples: np.ndarray, language: str) -> tuple[str, float, float] | None:
@@ -339,7 +365,14 @@ def read_chunk(keys: list[str], samples: np.ndarray, language: str) -> tuple[str
         handle.writeframes(samples.astype(np.int16).tobytes())
     payload = buffer.getvalue()
 
-    for key in keys:
+    # Start from the next account each time. Always starting at the first key
+    # spends one account's daily allowance and leaves the other idle until the
+    # first is rate limited, which throws away half the usable quota. Rotating
+    # spreads the load; the fall-through still applies when one is exhausted.
+    global _key_cursor
+    start = _key_cursor % len(keys)
+    _key_cursor += 1
+    for key in keys[start:] + keys[:start]:
         try:
             response = requests.post(
                 GROQ_ENDPOINT,
