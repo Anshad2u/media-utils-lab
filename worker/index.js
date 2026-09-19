@@ -8,10 +8,24 @@
 
 const MAX_BYTES = 19 * 1024 * 1024;
 
+// The uploader's endpoint. A secret path segment rather than a header, because a
+// watch app is unlikely to support custom headers, and it is the pattern Telegram
+// itself recommends for webhooks.
+const UPLOAD_PATH = "/w/";
+
 const ok = () => new Response("OK", { status: 200 });
 
 export default {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // Two endpoints with opposite contracts, kept deliberately apart. This one is
+    // for the recorder and must tell the caller the truth, because the caller marks
+    // a recording as uploaded on success - a comforting 200 would make it mark a
+    // file synced that never arrived. The webhook below is the opposite: it answers
+    // 200 to everything so a prober learns nothing.
+    if (url.pathname.startsWith(UPLOAD_PATH)) return upload(request, env, ctx, url);
+
     if (request.method !== "POST") return ok();
 
     const presented = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
@@ -151,6 +165,77 @@ function safeEqual(a, b) {
   let diff = 0;
   for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
+}
+
+function json(body, status) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/**
+ * The recorder's door.
+ *
+ * The recorder used to call Telegram itself, which is exactly why its recordings
+ * were invisible: a bot's own message is never delivered back to it, so the relay
+ * was never told a file existed. Now it posts here instead, and this function is
+ * the one that talks to Telegram - so it learns the file_id from the reply and can
+ * hand the work to CI.
+ *
+ * The caller's multipart body is forwarded verbatim, so the boundary and the field
+ * names survive untouched and the file is never buffered: a ten minute m4a is about
+ * 10 MB and there is no reason to hold it in memory.
+ */
+async function upload(request, env, ctx, url) {
+  if (request.method !== "POST") return json({ ok: false, description: "method not allowed" }, 405);
+
+  const presented = url.pathname.slice(UPLOAD_PATH.length).replace(/\/+$/, "");
+  if (!safeEqual(presented, env.UPLOAD_SECRET || "")) {
+    // An unset UPLOAD_SECRET closes the door entirely, and a wrong one says nothing
+    // that would confirm the endpoint exists.
+    return json({ ok: false, description: "not found" }, 404);
+  }
+
+  let response;
+  try {
+    response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendDocument`, {
+      method: "POST",
+      headers: { "Content-Type": request.headers.get("Content-Type") || "" },
+      body: request.body,
+    });
+  } catch {
+    return json({ ok: false, description: "could not reach Telegram" }, 502);
+  }
+
+  let text = "";
+  try {
+    text = await response.text();
+  } catch {
+    return json({ ok: false, description: "unreadable reply from Telegram" }, 502);
+  }
+
+  let fileId = "";
+  let chatId = env.TELEGRAM_CHAT_ID;
+  let messageId = null;
+  try {
+    const message = JSON.parse(text).result || {};
+    const media = message.document || message.audio || message.voice || {};
+    fileId = media.file_id || "";
+    if (message.chat && message.chat.id) chatId = message.chat.id;
+    if (message.message_id) messageId = message.message_id;
+  } catch {
+    // Not JSON. It is still returned as-is, so the caller sees whatever Telegram said.
+  }
+
+  // The recording is safely inside Telegram by now, so a failed dispatch must NOT
+  // make the caller think the upload failed - it would send again and the file
+  // would arrive twice. Report the dispatch problem to the owner instead.
+  if (fileId) ctx.waitUntil(dispatch(env, fileId, chatId, messageId, "document"));
+
+  // Telegram's own status and body, so the caller's existing success check keeps
+  // working without changing.
+  return new Response(text, { status: response.status, headers: { "Content-Type": "application/json" } });
 }
 
 async function dispatch(env, fileId, chatId, messageId, kind) {
