@@ -43,8 +43,19 @@ CHUNK_S = 28.0  # kept under Whisper's 30 s window
 MIN_CHUNK_S = 1.0  # trailing fragments below this are dropped
 MAX_CHUNKS = 60  # bounds the API calls one message can trigger (~28 min of speech)
 CHUNK_PAUSE_S = 1.0  # keeps us under the free tier's per-minute request cap
-LANGUAGE_BUCKETS = {"arabic": "Arabic", "english": "English"}
 TRANSCRIPT_LIMIT = 3500  # Telegram caps a message at 4096 characters
+
+# Language identification runs locally, so it is free and can be as fine grained
+# as we like. Whisper's own `language` field is deliberately NOT used for this:
+# it is a byproduct of decoding rather than a real classifier, it returns a
+# single label for a whole 28 s chunk, and it falls back to English on anything
+# outside its language set - which is exactly how a clip that moved through
+# English, Beary and Arabic came back as 100% English.
+LID_WINDOW_S = 3.0
+LID_HOP_S = 1.5
+MIN_LID_S = 1.0
+LANGUAGE_BUCKETS = {"ar": "Arabic", "en": "English"}
+OTHER_BUCKET = "Beary / other"
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("process")
@@ -289,8 +300,8 @@ def groq_keys() -> list[str]:
     ]
 
 
-def transcribe_chunk(keys: list[str], samples: np.ndarray) -> dict | None:
-    """Send one chunk, return {"language", "text"}, or None if no key worked."""
+def transcribe_chunk(keys: list[str], samples: np.ndarray) -> str | None:
+    """Send one chunk and return its text, or None if no key worked."""
     import io
 
     buffer = io.BytesIO()
@@ -321,10 +332,9 @@ def transcribe_chunk(keys: list[str], samples: np.ndarray) -> dict | None:
             except Exception:
                 log.warning("transcription: unreadable response")
                 continue
-            return {
-                "language": str(body.get("language") or "").strip().lower(),
-                "text": str(body.get("text") or "").strip(),
-            }
+            # Only the text is kept. Whisper's own `language` field is ignored on
+            # purpose - see the LID note in the constants block.
+            return str(body.get("text") or "").strip()
 
         # 401/403 means the key is dead, 429 means it is spent. Either way the
         # next key is worth trying before giving up on the chunk.
@@ -333,30 +343,99 @@ def transcribe_chunk(keys: list[str], samples: np.ndarray) -> dict | None:
     return None
 
 
-def language_mix(keys: list[str], samples: np.ndarray) -> tuple[dict[str, float], list[tuple[str, str]]]:
-    """Attribute every second of speech to a language bucket.
+def load_lid():
+    """The local language identifier. Same framework as the speaker encoder."""
+    from speechbrain.inference.classifiers import EncoderClassifier
 
-    Returns seconds per bucket plus the (bucket, text) of each chunk that gave
-    readable text. Beary lands in "Beary / other" whatever label Whisper guesses,
-    because it has no Beary to guess.
+    return EncoderClassifier.from_hparams(
+        source="speechbrain/lang-id-voxlingua107-ecapa",
+        savedir=str(Path("pretrained_models") / "lang-id-voxlingua107-ecapa"),
+        run_opts={"device": "cpu"},
+    )
+
+
+def language_windows(lid, samples: np.ndarray) -> list[tuple[float, float, str, float]]:
+    """Classify short overlapping windows -> [(start_s, end_s, iso, confidence)].
+
+    Windows are deliberately short. A single 28 s window can hold two or three
+    languages, and any classifier asked about a whole chunk has to answer with a
+    single label - which is how a mixed clip collapses to one language. Short
+    windows with a hop let the mix survive.
     """
+    import torch
+
+    span = int(LID_WINDOW_S * SAMPLE_RATE)
+    hop = int(LID_HOP_S * SAMPLE_RATE)
+    floor = int(MIN_LID_S * SAMPLE_RATE)
+
+    found: list[tuple[float, float, str, float]] = []
+    for start in range(0, max(1, len(samples) - span + hop), hop):
+        piece = samples[start: start + span]
+        if len(piece) < floor:
+            continue
+        waveform = torch.from_numpy(piece.astype(np.float32) / 32768.0)
+        try:
+            with torch.no_grad():
+                _, score, _, label = lid.classify_batch(waveform)
+        except Exception as error:
+            log.warning("language window failed: %s", describe(error))
+            continue
+        # label reads like "ar: Arabic"; the ISO code is what we bucket on.
+        code = str(label[0]).split(":")[0].strip().lower()
+        found.append((start / SAMPLE_RATE, (start + len(piece)) / SAMPLE_RATE, code, float(score[0].exp())))
+    return found
+
+
+def language_mix(windows: list[tuple[float, float, str, float]]) -> dict[str, float]:
+    """Seconds per bucket, weighted by the hop rather than the window length."""
+    seconds: dict[str, float] = {}
+    for _, _, code, _ in windows:
+        bucket = LANGUAGE_BUCKETS.get(code, OTHER_BUCKET)
+        seconds[bucket] = seconds.get(bucket, 0.0) + LID_HOP_S
+    return seconds
+
+
+def raw_labels(windows: list[tuple[float, float, str, float]]) -> str:
+    """Unfiltered label counts, for the log.
+
+    This is how we find out what Beary is actually being classified as, which is
+    the one thing that cannot be predicted in advance. Language codes carry no
+    speech content, so this is safe in a public log.
+    """
+    counts: dict[str, int] = {}
+    for _, _, code, _ in windows:
+        counts[code] = counts.get(code, 0) + 1
+    ordered = sorted(counts.items(), key=lambda item: -item[1])
+    return ", ".join(f"{code} {count}" for code, count in ordered) or "none"
+
+
+def dominant_bucket(windows: list[tuple[float, float, str, float]], start_s: float, end_s: float) -> str:
+    """The bucket holding most of the windows inside a span."""
+    counts: dict[str, int] = {}
+    for window_start, window_end, code, _ in windows:
+        if window_start >= start_s - LID_HOP_S and window_end <= end_s + LID_HOP_S:
+            bucket = LANGUAGE_BUCKETS.get(code, OTHER_BUCKET)
+            counts[bucket] = counts.get(bucket, 0) + 1
+    return max(counts, key=lambda key: counts[key]) if counts else OTHER_BUCKET
+
+
+def transcribe(keys: list[str], samples: np.ndarray, windows) -> str:
+    """Text for the readable languages, each line tagged with its bucket."""
     step = int(CHUNK_S * SAMPLE_RATE)
     floor = int(MIN_CHUNK_S * SAMPLE_RATE)
-    chunks = [samples[index: index + step] for index in range(0, len(samples), step)]
-    chunks = [chunk for chunk in chunks if len(chunk) >= floor][:MAX_CHUNKS]
+    pieces = [samples[index: index + step] for index in range(0, len(samples), step)]
+    pieces = [piece for piece in pieces if len(piece) >= floor][:MAX_CHUNKS]
 
-    seconds: dict[str, float] = {}
-    said: list[tuple[str, str]] = []
-    for index, chunk in enumerate(chunks):
-        result = transcribe_chunk(keys, chunk)
-        if result:
-            bucket = LANGUAGE_BUCKETS.get(result["language"], "Beary / other")
-            seconds[bucket] = seconds.get(bucket, 0.0) + len(chunk) / SAMPLE_RATE
-            if result["text"]:
-                said.append((bucket, result["text"]))
-        if index + 1 < len(chunks):
+    lines: list[str] = []
+    for index, piece in enumerate(pieces):
+        text = transcribe_chunk(keys, piece)
+        if text:
+            start_s = index * CHUNK_S
+            span = len(piece) / SAMPLE_RATE
+            lines.append(f"[{dominant_bucket(windows, start_s, start_s + span)}] {text}")
+        if index + 1 < len(pieces):
             time.sleep(CHUNK_PAUSE_S)
-    return seconds, said
+    return "\n".join(lines)
 
 
 def windows(run: tuple[float, float], total_s: float) -> list[tuple[float, float]]:
@@ -508,25 +587,26 @@ def process(token: str, chat_id: str, file_id: str, reference: np.ndarray, thres
         # Language mix. Non-fatal by design: the recording is the deliverable, and
         # a spent API quota must not cost the user their audio.
         mix_line, transcript = "", ""
-        if transcribe_mode() == "on":
-            keys = groq_keys()
-            if not keys:
-                log.info("language mix skipped: no key configured")
-            elif kept_seconds > MAX_CHUNKS * CHUNK_S:
-                log.info("language mix skipped: over the chunk budget")
-            else:
-                try:
-                    seconds, said = language_mix(keys, read_wav(joined))
-                    total = sum(seconds.values())
-                    if total:
-                        mix_line = " | " + " ".join(
-                            f"{name} {value / total * 100:.0f}%"
-                            for name, value in sorted(seconds.items(), key=lambda item: -item[1])
-                        )
-                        transcript = "\n".join(f"[{name}] {text}" for name, text in said)
-                        log.info("language mix over %.1f s across %d bucket(s)", total, len(seconds))
-                except Exception as error:
-                    log.warning("language mix failed: %s", describe(error))
+        if transcribe_mode() == "on" and kept_seconds <= MAX_CHUNKS * CHUNK_S:
+            try:
+                windows = language_windows(load_lid(), read_wav(joined))
+                seconds = language_mix(windows)
+                total = sum(seconds.values())
+                if total:
+                    mix_line = " | " + " ".join(
+                        f"{name} {value / total * 100:.0f}%"
+                        for name, value in sorted(seconds.items(), key=lambda item: -item[1])
+                    )
+                    log.info("language windows over %.1f s: %s", total, raw_labels(windows))
+                keys = groq_keys()
+                if keys and windows:
+                    transcript = transcribe(keys, read_wav(joined), windows)
+                elif not keys:
+                    log.info("transcript skipped: no key configured")
+            except Exception as error:
+                log.warning("language mix failed: %s", describe(error))
+        elif transcribe_mode() == "on":
+            log.info("language mix skipped: over the chunk budget")
 
         caption = (
             f"original {original:.1f}s | kept {kept_seconds:.1f}s | "
@@ -547,16 +627,28 @@ def main() -> int:
     token = setting("TELEGRAM_BOT_TOKEN")
 
     if (os.environ.get("SELFTEST") or "").strip().lower() in {"1", "true", "yes"}:
-        # Environment check: prove the model loads before trusting a real run.
+        # Environment check: prove the models load before trusting a real run.
         try:
             encoder = load_encoder()
             noise = np.random.default_rng(0).standard_normal(SAMPLE_RATE * 4) * 1000
             vector = embed(encoder, noise.astype(np.int16))
             log.info("selftest ok, embedding dim %d", vector.shape[0])
-            return 0
         except Exception as error:
             log.warning("selftest failed: %s", describe(error))
             return 1
+
+        if transcribe_mode() == "on":
+            # Proves the language identifier loads and runs before a real message
+            # depends on it. The labels below are meaningless because the input is
+            # noise, but a failure to load shows up immediately.
+            try:
+                windows = language_windows(load_lid(), noise.astype(np.int16))
+                log.info("selftest ok, lid windows %d, labels: %s", len(windows), raw_labels(windows))
+            except Exception as error:
+                log.warning("selftest failed: %s", describe(error))
+                return 1
+
+        return 0
 
     allowed = setting("ALLOWED_CHAT_ID").strip()
     dispatch = payload()

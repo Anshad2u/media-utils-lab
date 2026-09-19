@@ -48,7 +48,10 @@ jobs:
             pretrained_models
             ~/.cache/huggingface
             ~/.cache/torch
-          key: models-ecapa-v1
+          # Bumped whenever the model set changes. A cache hit is restored but
+          # never re-saved, so adding weights without a new key means they
+          # re-download on every single run.
+          key: models-v3
 
       - name: Install CPU-only torch
         run: |
