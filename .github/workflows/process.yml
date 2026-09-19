@@ -76,3 +76,32 @@ jobs:
         run: |
           set +x
           python process.py
+
+  notify:
+    # A separate job on purpose. When the process job is killed by its own
+    # timeout, its remaining steps never execute, so an `if: failure()` step
+    # inside that job would never fire for the one case that matters most.
+    # A dependent job is still scheduled when the job it needs has failed.
+    needs: [process]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Send a Telegram notice
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
+          EVENT_NAME: ${{ github.event_name }}
+          # Built from public values only, so it is safe to put in the message.
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +x
+          # The script text is printed in the log, so the token appears here only
+          # as ${TELEGRAM_BOT_TOKEN}. curl is used rather than Python because this
+          # has to work even when the dependency install is what failed.
+          curl -s -o /dev/null --max-time 20 \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${ALLOWED_CHAT_ID}" \
+            --data-urlencode "text=media-utils-lab: a run failed (${EVENT_NAME}). ${RUN_URL}" \
+            || echo "notice not delivered"
