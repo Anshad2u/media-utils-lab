@@ -1,18 +1,45 @@
-# Media — never commit source or intermediate audio
+# Media — never commit source or intermediate audio.
+# Kept in step with AUDIO_EXTENSIONS in worker/index.js. Every format the relay
+# will accept from a recorder is a format that must never be committable, or a
+# file left in a working copy becomes a published recording. An ignore list that
+# is narrower than the accept list leaves exactly that gap.
 *.wav
 *.m4a
 *.mp3
 *.mp4
 *.ogg
 *.oga
+*.opus
+*.aac
+*.flac
+*.3gp
+*.amr
+*.weba
+*.aiff
+*.aif
+*.caf
+*.wma
+*.m4b
+*.mov
+*.mkv
+*.webm
 
 # Secrets / local environment
 .env*
 
-# Model weights and embeddings
+# Model weights and embeddings. The voice embedding is the one that matters:
+# a 192-float vector is enough to recognise the speaker, and it is stored as a
+# secret for that reason, so it must not be committable either.
 *.npy
 *.pt
+*.bin
+*.onnx
+*.safetensors
+*.ckpt
+*.h5
 pretrained_models/
+embedding*.json
+*embedding*.json
 
 # Tooling
 node_modules/
