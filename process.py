@@ -101,13 +101,20 @@ def download(token: str, file_id: str, destination: Path) -> bool:
     return destination.stat().st_size > 0
 
 
-def send_document(token: str, chat_id: str, path: Path, caption: str) -> bool:
+def send_document(
+    token: str,
+    chat_id: str,
+    path: Path,
+    caption: str,
+    filename: str = "clip.m4a",
+    mime: str = "audio/mp4",
+) -> bool:
     try:
         with path.open("rb") as handle:
             response = requests.post(
                 f"{API_ROOT}/bot{token}/sendDocument",
                 data={"chat_id": chat_id, "caption": caption},
-                files={"document": ("clip.m4a", handle, "audio/mp4")},
+                files={"document": (filename, handle, mime)},
                 timeout=600,
             )
     except Exception:
@@ -261,6 +268,55 @@ def render(samples: np.ndarray, runs: list[tuple[float, float]], destination: Pa
 
 
 # --------------------------------------------------------------------------- #
+# Enrolment
+# --------------------------------------------------------------------------- #
+
+def enroll(token: str, chat_id: str, file_id: str) -> int:
+    """Bootstrap: turn one clean recording into the reference vector.
+
+    Only reachable while VOICE_EMBEDDING is unset, and only from the allowed chat,
+    so this stops working the moment enrolment succeeds. Computing the vector here
+    rather than on a laptop guarantees it comes from the same model, the same
+    library versions and the same 16 kHz mono preprocessing as every comparison
+    it will later be measured against.
+    """
+    with tempfile.TemporaryDirectory() as workspace:
+        root = Path(workspace)
+        source, decoded, payload = root / "ref.bin", root / "ref.wav", root / "embedding.json"
+
+        if not download(token, file_id, source):
+            telegram_text(token, chat_id, "Could not fetch that file.")
+            return 1
+        if not decode(source, decoded):
+            telegram_text(token, chat_id, "Could not decode that file.")
+            return 1
+
+        samples = read_wav(decoded)
+        seconds = len(samples) / SAMPLE_RATE
+        log.info("enrolment clip length: %.1f s", seconds)
+        if seconds < 3.0:
+            telegram_text(token, chat_id, "Too short. Send 10-20 seconds of clean speech.")
+            return 0
+
+        vector = embed(load_encoder(), samples)
+        payload.write_text(
+            json.dumps([round(float(value), 6) for value in vector]), encoding="utf-8"
+        )
+
+        caption = (
+            f"Reference embedding from {seconds:.1f}s of audio. "
+            "Store the contents of this file as the VOICE_EMBEDDING secret, "
+            "then delete this message."
+        )
+        if not send_document(token, chat_id, payload, caption, "embedding.json", "application/json"):
+            telegram_text(token, chat_id, "Could not send the result.")
+            return 1
+
+        log.info("enrolment complete")
+        return 0
+
+
+# --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
 
@@ -334,8 +390,19 @@ def main() -> int:
         log.info("no file reference in payload")
         return 0
 
+    raw_reference = (os.environ.get("VOICE_EMBEDDING") or "").strip()
+
+    if not raw_reference:
+        # Nothing enrolled yet, so treat this message as the reference recording.
+        try:
+            return enroll(token, chat_id, file_id)
+        except Exception:
+            log.warning("enrolment failed")
+            telegram_text(token, chat_id, "Enrolment failed.")
+            return 1
+
     try:
-        reference = np.asarray(json.loads(setting("VOICE_EMBEDDING")), dtype=np.float32)
+        reference = np.asarray(json.loads(raw_reference), dtype=np.float32)
     except Exception:
         log.warning("reference embedding unusable")
         return 1
