@@ -24,20 +24,38 @@ export default {
       return ok();
     }
 
-    const message = update.message || update.edited_message;
+    // Every update type that can carry a message. `channel_post` matters: a
+    // recorder that posts into a channel produces a channel_post, not a message,
+    // and a relay that looks only at `message` drops it with no error anywhere -
+    // which is the same silent failure the watch uploads showed.
+    const message =
+      update.message ||
+      update.edited_message ||
+      update.channel_post ||
+      update.edited_channel_post ||
+      update.business_message ||
+      update.edited_business_message;
     if (!message || !message.chat) return ok();
 
-    if (String(message.chat.id) !== String(env.TELEGRAM_CHAT_ID)) {
+    // TELEGRAM_CHAT_ID may hold more than one id, comma separated, so a second
+    // source (a channel the recorder posts into, say) can be allowed later
+    // without a redeploy.
+    const allowed = String(env.TELEGRAM_CHAT_ID || "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+
+    if (!allowed.includes(String(message.chat.id))) {
       // A message from somewhere other than the owner's chat. Never reply to the
       // sender - that would confirm the bot is alive - but do tell the owner, in
       // the owner's own chat. This is how a file sent from a different account or
       // a different chat becomes visible instead of vanishing, which is exactly
-      // why the watch uploads looked like they had never been sent at all.
+      // why the watch uploads looked like they had never been sent at all. The id
+      // is reported so it can be pasted straight into TELEGRAM_CHAT_ID.
       const shape = describeUpload(message);
-      if (shape) {
-        ctx.waitUntil(
-          say(env, env.TELEGRAM_CHAT_ID, `Message from another chat (id ${message.chat.id}): ${shape}`),
-        );
+      const owner = allowed[0];
+      if (shape && owner) {
+        ctx.waitUntil(say(env, owner, `Message from another chat (id ${message.chat.id}): ${shape}`));
       }
       return ok();
     }
@@ -147,12 +165,22 @@ async function dispatch(env, fileId, chatId, messageId, kind) {
     });
     // 204 is the documented success status for a dispatch.
     if (response.status !== 204) {
-      await say(env, chatId, "Could not queue the job.");
+      // The status alone is the diagnosis, and none of it is sensitive: 401 means
+      // the token is rejected or expired, 403 means it cannot reach the repo, 404
+      // means the repo name is wrong or invisible to the token, 422 means the event
+      // type is not one the workflow listens for. Reporting it turns the last
+      // silent failure - "the file vanished and nothing anywhere said why" - into
+      // something actionable.
+      await say(env, chatId, `Could not queue the job (http ${response.status}).`);
     } else {
       await say(env, chatId, "Queued.");
     }
   } catch {
-    // Stay silent: thrown fetch errors can carry the token in their message.
+    // A thrown fetch error carries the failed request, and that request carries the
+    // token in its Authorization header, so the error text is never echoed. The
+    // failure itself must still be visible: otherwise a network fault looks exactly
+    // like a file that was never sent.
+    await say(env, chatId, "Could not reach GitHub to queue the job.");
   }
 }
 
