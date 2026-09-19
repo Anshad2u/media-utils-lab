@@ -479,18 +479,26 @@ def repetitive(text: str) -> bool:
     return len(set(words)) / len(words) < REPETITION_FLOOR
 
 
-def decide_chunk(keys: list[str], samples: np.ndarray) -> tuple[str, str | None, str]:
+def decide_chunk(keys: list[str], samples: np.ndarray, preferred: str | None = None) -> tuple[str, str | None, str]:
     """(bucket, iso code, text) for one chunk.
 
     Every candidate language gets a reading. A reading is discarded if the model
-    found no speech or if it looped. The most confident survivor then has to clear
-    LANGUAGE_FLOOR; below that no candidate really fits and the chunk is left as
-    "other", which is what Beary looks like to a model that has none of its
-    languages.
+    found no speech or if it looped. If none survives, or none clears
+    LANGUAGE_FLOOR, the chunk is left as "other", which is what Beary looks like
+    to a model that has none of its languages.
 
-    There is deliberately no margin requirement here. Requiring the winner to beat
-    the runner-up threw away a correct, highly confident Arabic reading because
-    English scored nearly as well - see the note on LANGUAGE_FLOOR.
+    Among the readings that clear the floor, the acoustics choose - `preferred`,
+    from the local identifier. The reading's own avg_logprob cannot make that
+    choice, because it measures how fluent the text is and a *translation* is
+    fluent. Forced into a language it cannot hear, Whisper renders the speech in
+    that language instead of refusing, so the two readings are not two
+    transcriptions of the same audio: one is a transcription and the other is a
+    rendering, and the rendering can outscore it. On a chunk holding two
+    languages the comparison then picks the wrong one with confidence - which is
+    how a sentence spoken in English came back as Arabic. The floor still decides
+    whether any candidate fits at all, so "other" is unaffected; falling back to
+    the most confident reading when the acoustics name no survivor keeps this a
+    tie-break rather than a takeover.
     """
     readings: list[tuple[str, float, str]] = []
     for code in LANGUAGE_CANDIDATES:
@@ -516,9 +524,13 @@ def decide_chunk(keys: list[str], samples: np.ndarray) -> tuple[str, str | None,
     # log-safe.
     log.info("chunk readings: %s", ", ".join(f"{code} {score:.2f}" for code, score, _ in readings))
 
-    code, score, text = readings[0]
-    if score < LANGUAGE_FLOOR:
+    # A reading is a fit only if it clears the floor. The list is sorted by score,
+    # so an empty fits list is exactly the old "the winner is below the floor"
+    # case - nothing about the "other" bucket moves.
+    fits = [item for item in readings if item[1] >= LANGUAGE_FLOOR]
+    if not fits:
         return OTHER_BUCKET, None, ""
+    code, _, text = next((item for item in fits if item[0] == preferred), fits[0])
     return LANGUAGE_BUCKETS[code], code, text
 
 
@@ -533,21 +545,55 @@ def load_lid():
     )
 
 
-def language_windows(lid, samples: np.ndarray) -> list[tuple[float, float, str, float]]:
-    """Classify short overlapping windows -> [(start_s, end_s, iso, confidence)].
+def candidate_indices(lid) -> dict[str, list[int]]:
+    """ISO code -> the class indices whose label carries that code.
+
+    Read from the loaded model rather than hard-coded. An index guessed from a
+    model card would be a silent mistake: the numbers would still look like
+    scores, and every decision built on them would be quietly meaningless.
+    """
+    encoder = lid.hparams.label_encoder
+    table = getattr(encoder, "ind2lab", None)
+    if not table:
+        table = {index: label for label, index in encoder.lab2ind.items()}
+    indices: dict[str, list[int]] = {}
+    for index, label in table.items():
+        code = str(label).split(":")[0].strip().lower()
+        if code in LANGUAGE_CANDIDATES:
+            indices.setdefault(code, []).append(int(index))
+    return indices
+
+
+def language_windows(lid, samples: np.ndarray) -> list[tuple[float, float, str, float, dict[str, float]]]:
+    """Classify short windows -> [(start_s, end_s, iso, confidence, candidate_probs)].
 
     Windows are deliberately short. A single 28 s window can hold two or three
     languages, and any classifier asked about a whole chunk has to answer with a
     single label - which is how a mixed clip collapses to one language. Short
     windows with a hop let the mix survive.
+
+    The fifth field is the posterior mass each candidate language holds in that
+    window. The identifier's top-1 label is unreliable on this speaker - asked
+    about Beary it spreads across Kannada, Telugu, Nepali and Sinhala at low
+    confidence - but the question asked of it here is far narrower, and a two-way
+    choice between languages as unlike each other as Arabic and English is a much
+    easier call than a 107-way argmax. Same pass over the audio, same model, one
+    extra number per window.
     """
     import torch
 
     span = int(LID_WINDOW_S * SAMPLE_RATE)
     hop = int(LID_HOP_S * SAMPLE_RATE)
     floor = int(MIN_LID_S * SAMPLE_RATE)
+    indices = candidate_indices(lid)
+    absent = [code for code in LANGUAGE_CANDIDATES if code not in indices]
+    if absent:
+        # Without this the vote is silently empty, every chunk falls back to the
+        # old behaviour, and the change looks like it simply did not work rather
+        # than like a broken label lookup.
+        log.warning("language identifier has no class for: %s", ", ".join(absent))
 
-    found: list[tuple[float, float, str, float]] = []
+    found: list[tuple[float, float, str, float, dict[str, float]]] = []
     for start in range(0, max(1, len(samples) - span + hop), hop):
         piece = samples[start: start + span]
         if len(piece) < floor:
@@ -555,17 +601,55 @@ def language_windows(lid, samples: np.ndarray) -> list[tuple[float, float, str, 
         waveform = torch.from_numpy(piece.astype(np.float32) / 32768.0)
         try:
             with torch.no_grad():
-                _, score, _, label = lid.classify_batch(waveform)
+                posterior, score, _, label = lid.classify_batch(waveform)
         except Exception as error:
             log.warning("language window failed: %s", describe(error))
             continue
         # label reads like "ar: Arabic"; the ISO code is what we bucket on.
         code = str(label[0]).split(":")[0].strip().lower()
-        found.append((start / SAMPLE_RATE, (start + len(piece)) / SAMPLE_RATE, code, float(score[0].exp())))
+        row = posterior[0]
+        # The classifier hands back log-probabilities - the confidence above is
+        # already one of them exponentiated to get a value in [0, 1] - so they are
+        # exponentiated before being summed. Summing the logs instead would give a
+        # negative number that still sorts the right way most of the time, which
+        # is the worst kind of wrong: it would look like it worked.
+        probs = {name: float(row[at].exp().sum()) for name, at in indices.items()}
+        found.append(
+            (start / SAMPLE_RATE, (start + len(piece)) / SAMPLE_RATE, code, float(score[0].exp()), probs)
+        )
     return found
 
 
-def raw_labels(windows: list[tuple[float, float, str, float]]) -> str:
+def preferred_language(
+    windows: list[tuple[float, float, str, float, dict[str, float]]],
+) -> tuple[str | None, str]:
+    """(favoured candidate, log-safe reading of the vote) for one chunk.
+
+    Windows vote rather than one window deciding, because a single 3 s window
+    inside a chunk can land on a pause and name the wrong language for the whole
+    chunk. The reading is what makes a wrong call diagnosable: it shows whether
+    the vote was lopsided or a coin toss, which a bare winner cannot.
+    """
+    if not windows:
+        return None, "no reading"
+    totals = {code: 0.0 for code in LANGUAGE_CANDIDATES}
+    votes = {code: 0 for code in LANGUAGE_CANDIDATES}
+    for _, _, _, _, probs in windows:
+        for code in LANGUAGE_CANDIDATES:
+            totals[code] += probs.get(code, 0.0)
+        winner = max(LANGUAGE_CANDIDATES, key=lambda code: probs.get(code, 0.0))
+        votes[winner] += 1
+    reading = " ".join(
+        f"{code} {votes[code]}/{len(windows)}@{totals[code] / len(windows):.2f}"
+        for code in LANGUAGE_CANDIDATES
+    )
+    first, second = LANGUAGE_CANDIDATES
+    if totals[first] == totals[second]:
+        return None, reading
+    return max(LANGUAGE_CANDIDATES, key=lambda code: totals[code]), reading
+
+
+def raw_labels(windows: list[tuple[float, float, str, float, dict[str, float]]]) -> str:
     """Unfiltered label counts and mean confidence, for the log.
 
     The confidence is the important half. A model that is out of its depth does
@@ -575,7 +659,7 @@ def raw_labels(windows: list[tuple[float, float, str, float]]) -> str:
     content, so this is safe in a public log.
     """
     stats: dict[str, list[float]] = {}
-    for _, _, code, confidence in windows:
+    for _, _, code, confidence, _ in windows:
         stats.setdefault(code, []).append(confidence)
     ordered = sorted(stats.items(), key=lambda item: -len(item[1]))
     return ", ".join(f"{code} {len(c):d}@{sum(c) / len(c):.2f}" for code, c in ordered) or "none"
@@ -597,9 +681,13 @@ def language_report(samples: np.ndarray) -> tuple[str, str]:
     if transcribe_mode() != "on":
         return "", ""
 
-    # Comparison only. Never used to decide anything.
+    # One pass over the audio, used twice: the whole-recording label counts are
+    # logged for comparison, and the same windows are re-read per chunk to say
+    # which candidate the acoustics favour there.
+    marks: list[tuple[float, float, str, float, dict[str, float]]] = []
     try:
-        log.info("acoustic labels: %s", raw_labels(language_windows(load_lid(), samples)))
+        marks = language_windows(load_lid(), samples)
+        log.info("acoustic labels: %s", raw_labels(marks))
     except Exception as error:
         log.warning("acoustic labelling failed: %s", describe(error))
 
@@ -610,8 +698,10 @@ def language_report(samples: np.ndarray) -> tuple[str, str]:
 
     step = int(CHUNK_S * SAMPLE_RATE)
     floor = int(MIN_CHUNK_S * SAMPLE_RATE)
-    pieces = [samples[index: index + step] for index in range(0, len(samples), step)]
-    pieces = [piece for piece in pieces if len(piece) >= floor]
+    # The offset travels with the piece so each chunk can claim the identifier
+    # windows that fall inside it.
+    pieces = [(index, samples[index: index + step]) for index in range(0, len(samples), step)]
+    pieces = [(index, piece) for index, piece in pieces if len(piece) >= floor]
     if not pieces:
         log.info("language mix: nothing long enough to read")
         return "", ""
@@ -629,8 +719,15 @@ def language_report(samples: np.ndarray) -> tuple[str, str]:
 
     seconds: dict[str, float] = {}
     lines: list[str] = []
-    for piece in pieces:
-        bucket, _, text = decide_chunk(keys, piece)
+    for offset, piece in pieces:
+        left = offset / SAMPLE_RATE
+        right = (offset + len(piece)) / SAMPLE_RATE
+        # Only windows lying wholly inside this chunk vote on it, so a window
+        # straddling the boundary cannot colour both neighbours.
+        inside = [window for window in marks if window[0] >= left and window[1] <= right]
+        preferred, vote = preferred_language(inside)
+        log.info("chunk acoustics: %s", vote)
+        bucket, _, text = decide_chunk(keys, piece, preferred)
         seconds[bucket] = seconds.get(bucket, 0.0) + len(piece) / SAMPLE_RATE
         # Beary has no model that can read it, so it is labelled and left alone
         # rather than turned into confident nonsense - which also saves the call.
@@ -897,7 +994,7 @@ def main() -> int:
                         return 1
                     known = language_windows(load_lid(), read_wav(wav))
                     log.info("selftest lid known answer (expect th): %s", raw_labels(known))
-                    if "th" not in {code for _, _, code, _ in known}:
+                    if "th" not in {code for _, _, code, _, _ in known}:
                         log.warning("selftest failed: known-answer sample not identified as Thai")
                         return 1
             except Exception as error:
