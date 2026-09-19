@@ -100,8 +100,11 @@ jobs:
           # The script text is printed in the log, so the token appears here only
           # as ${TELEGRAM_BOT_TOKEN}. curl is used rather than Python because this
           # has to work even when the dependency install is what failed.
-          curl -s -o /dev/null --max-time 20 \
+          # Only the status code is echoed; the response body is discarded, and
+          # curl exit 0 alone would not prove Telegram accepted the message.
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
             -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${ALLOWED_CHAT_ID}" \
             --data-urlencode "text=media-utils-lab: a run failed (${EVENT_NAME}). ${RUN_URL}" \
-            || echo "notice not delivered"
+            || true)
+          echo "telegram notice: http ${code:-no-response}"
