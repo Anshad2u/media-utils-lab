@@ -196,6 +196,26 @@ def telegram_text(token: str, chat_id: str, text: str) -> None:
     telegram_json(token, "sendMessage", {"chat_id": chat_id, "text": text})
 
 
+def routine_notice(token: str, chat_id: str, kind: str, text: str) -> None:
+    """Report an outcome that is normal, not a fault.
+
+    Whether to speak up depends on who is listening. A person who just sent a
+    voice note and hears nothing back cannot tell "nothing matched" from "the
+    pipeline is broken", so they are told. An automated upload has nobody waiting
+    on it, and once the recorder only sends speech, a recording the voice match
+    declines is an ordinary result rather than an exception - at roughly a hundred
+    files an hour, reporting each one buries the messages that do need a person.
+
+    Faults do not come through here. A file that could not be fetched, decoded or
+    sent is a real problem and is reported for both kinds, because the alternative
+    is a failure that nobody ever learns about.
+    """
+    if kind == "document":
+        log.info("not notifying an automated upload: %s", text)
+        return
+    telegram_text(token, chat_id, text)
+
+
 def download(token: str, file_id: str, destination: Path) -> bool:
     meta = telegram_json(token, "getFile", {"file_id": file_id})
     if not meta or not meta.get("ok"):
@@ -931,7 +951,8 @@ def process(
             # cases for the person who made the recording, without quoting
             # anything they said.
             detail = "silent recording" if peak_db < -50 else f"peak {peak_db:.0f} dBFS"
-            telegram_text(token, chat_id, f"No speech found in {original:.0f}s ({detail}).")
+            routine_notice(token, chat_id, kind,
+                           f"No speech found in {original:.0f}s ({detail}).")
             return 0
 
         samples = read_wav(decoded)
@@ -961,7 +982,7 @@ def process(
 
         log.info("matching runs: %d", len(kept))
         if not kept:
-            telegram_text(token, chat_id, "No matching speech found.")
+            routine_notice(token, chat_id, kind, "No matching speech found.")
             return 0
 
         merged = fuse(kept, total_s)
