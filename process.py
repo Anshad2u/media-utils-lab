@@ -39,11 +39,22 @@ JOIN_GAP_S = 0.15  # silence inserted between fused runs
 # Transcription / language mix
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3-turbo"
-CHUNK_S = 28.0  # kept under Whisper's 30 s window
+CHUNK_S = 8.0  # short enough that a chunk rarely spans two languages
 MIN_CHUNK_S = 1.0  # trailing fragments below this are dropped
-MAX_CHUNKS = 60  # bounds the API calls one message can trigger (~28 min of speech)
-CHUNK_PAUSE_S = 1.0  # keeps us under the free tier's per-minute request cap
+MAX_CHUNKS = 80  # bounds the API calls one message can trigger (~10 min of speech)
+CHUNK_PAUSE_S = 5.0  # two calls per chunk, paced under the free tier's request cap
 TRANSCRIPT_LIMIT = 3500  # Telegram caps a message at 4096 characters
+
+# A chunk is transcribed once per candidate language, and the more confident
+# reading wins. This is content-aware rather than acoustic, which matters here:
+# the acoustic identifier handles a clean studio sample at 0.95 confidence and
+# still scatters a compressed voice note with an Indian accent across Tamil,
+# Telugu, Malayalam, Urdu and Assamese. The transcriber is far better at accented
+# speech, and the confidence tells us when neither language fits - which is what
+# Beary looks like to it.
+LANGUAGE_CANDIDATES = ("ar", "en")
+LANGUAGE_FLOOR = -0.80  # below this, the reading is not credible
+SILENCE_CEILING = 0.60  # no_speech_prob above this means there was nothing to read
 
 # Language identification runs locally, so it is free and can be as fine grained
 # as we like. Whisper's own `language` field is deliberately NOT used for this:
@@ -307,12 +318,14 @@ def groq_keys() -> list[str]:
     ]
 
 
-def transcribe_chunk(keys: list[str], samples: np.ndarray, language: str) -> str | None:
-    """Send one chunk and return its text, or None if no key worked.
+def read_chunk(keys: list[str], samples: np.ndarray, language: str) -> tuple[str, float, float] | None:
+    """Transcribe one chunk in a forced language.
+
+    Returns (text, mean avg_logprob, no_speech_prob), or None if no key worked.
 
     `language` is an ISO-639-1 code and is always passed. Left out, the model
-    picks for itself and may decide to answer in English, which silently turns a
-    transcription into a translation.
+    picks for itself and may answer in English, which silently turns a
+    transcription into a translation - that is why Arabic came back as English.
     """
     import io
 
@@ -322,13 +335,14 @@ def transcribe_chunk(keys: list[str], samples: np.ndarray, language: str) -> str
         handle.setsampwidth(2)
         handle.setframerate(SAMPLE_RATE)
         handle.writeframes(samples.astype(np.int16).tobytes())
+    payload = buffer.getvalue()
 
     for key in keys:
         try:
             response = requests.post(
                 GROQ_ENDPOINT,
                 headers={"Authorization": f"Bearer {key}"},
-                files={"file": ("chunk.wav", buffer.getvalue(), "audio/wav")},
+                files={"file": ("chunk.wav", payload, "audio/wav")},
                 data={
                     "model": GROQ_MODEL,
                     "response_format": "verbose_json",
@@ -348,15 +362,60 @@ def transcribe_chunk(keys: list[str], samples: np.ndarray, language: str) -> str
             except Exception:
                 log.warning("transcription: unreadable response")
                 continue
-            # Only the text is kept. Whisper's own `language` field is ignored on
-            # purpose - see the LID note in the constants block.
-            return str(body.get("text") or "").strip()
+            segments = body.get("segments") or []
+            scores = [
+                float(segment["avg_logprob"])
+                for segment in segments
+                if segment.get("avg_logprob") is not None
+            ]
+            silence = max(
+                (float(segment.get("no_speech_prob", 0.0)) for segment in segments),
+                default=0.0,
+            )
+            mean = sum(scores) / len(scores) if scores else LANGUAGE_FLOOR
+            return str(body.get("text") or "").strip(), mean, silence
 
-        # 401/403 means the key is dead, 429 means it is spent. Either way the
-        # next key is worth trying before giving up on the chunk.
+        if response.status_code == 429:
+            # Rate limited rather than rejected, so waiting is worth it.
+            log.info("transcription rate limited, backing off")
+            time.sleep(5.0)
+            continue
+
+        # 401/403 means the key is dead. Either way the next key is worth trying.
         log.warning("transcription http %s", response.status_code)
 
     return None
+
+
+def decide_chunk(keys: list[str], samples: np.ndarray) -> tuple[str, str | None, str]:
+    """(bucket, iso code, text) for one chunk.
+
+    Every candidate language gets a reading and the most confident one wins, but
+    only if it clears LANGUAGE_FLOOR. When neither language reads the chunk
+    convincingly the chunk is Beary, and we say so rather than forcing it into
+    whichever language happened to score marginally higher.
+    """
+    best: tuple[str, float, str] | None = None
+    for code in LANGUAGE_CANDIDATES:
+        reading = read_chunk(keys, samples, code)
+        if reading is None:
+            continue
+        text, score, silence = reading
+        if silence >= SILENCE_CEILING:
+            continue
+        if best is None or score > best[1]:
+            best = (code, score, text)
+        time.sleep(CHUNK_PAUSE_S / len(LANGUAGE_CANDIDATES))
+
+    if best is None:
+        return OTHER_BUCKET, None, ""
+
+    code, score, text = best
+    # A language code and a float carry no speech content, so this is log-safe.
+    log.info("chunk read as %s at %.2f", code, score)
+    if score < LANGUAGE_FLOOR:
+        return OTHER_BUCKET, None, ""
+    return LANGUAGE_BUCKETS[code], code, text
 
 
 def load_lid():
@@ -402,15 +461,6 @@ def language_windows(lid, samples: np.ndarray) -> list[tuple[float, float, str, 
     return found
 
 
-def language_mix(windows: list[tuple[float, float, str, float]]) -> dict[str, float]:
-    """Seconds per bucket, weighted by the hop rather than the window length."""
-    seconds: dict[str, float] = {}
-    for _, _, code, _ in windows:
-        bucket = LANGUAGE_BUCKETS.get(code, OTHER_BUCKET)
-        seconds[bucket] = seconds.get(bucket, 0.0) + LID_HOP_S
-    return seconds
-
-
 def raw_labels(windows: list[tuple[float, float, str, float]]) -> str:
     """Unfiltered label counts and mean confidence, for the log.
 
@@ -427,85 +477,57 @@ def raw_labels(windows: list[tuple[float, float, str, float]]) -> str:
     return ", ".join(f"{code} {len(c):d}@{sum(c) / len(c):.2f}" for code, c in ordered) or "none"
 
 
-def dominant_window(
-    windows: list[tuple[float, float, str, float]], start_s: float, end_s: float
-) -> tuple[str, str | None]:
-    """(bucket, iso code) holding most of the windows inside a span.
-
-    The code is None for anything landing in the other bucket, which is the
-    signal that the span should not be transcribed at all.
-    """
-    counts: dict[tuple[str, str | None], int] = {}
-    for window_start, window_end, code, _ in windows:
-        if window_start >= start_s - LID_HOP_S and window_end <= end_s + LID_HOP_S:
-            bucket = LANGUAGE_BUCKETS.get(code, OTHER_BUCKET)
-            key = (bucket, code if bucket != OTHER_BUCKET else None)
-            counts[key] = counts.get(key, 0) + 1
-    if not counts:
-        return OTHER_BUCKET, None
-    return max(counts, key=lambda key: counts[key])
-
-
-def transcribe(keys: list[str], samples: np.ndarray, windows) -> str:
-    """Text for the readable languages, each line tagged with its bucket.
-
-    Only Arabic and English are sent for transcription. Beary has no model that
-    can read it, so a chunk in that bucket is labelled and left alone rather than
-    turned into confident nonsense - and it saves the API call.
-    """
-    step = int(CHUNK_S * SAMPLE_RATE)
-    floor = int(MIN_CHUNK_S * SAMPLE_RATE)
-    pieces = [samples[index: index + step] for index in range(0, len(samples), step)]
-    pieces = [piece for piece in pieces if len(piece) >= floor][:MAX_CHUNKS]
-
-    lines: list[str] = []
-    for index, piece in enumerate(pieces):
-        start_s = index * CHUNK_S
-        span = len(piece) / SAMPLE_RATE
-        bucket, code = dominant_window(windows, start_s, start_s + span)
-        if code is None:
-            lines.append(f"[{bucket}] (not transcribed)")
-            continue
-        # Passing the language explicitly is what keeps Arabic in Arabic script.
-        # Without it the model is free to fall back to English and translate,
-        # which is exactly what it did before.
-        text = transcribe_chunk(keys, piece, code)
-        if text:
-            lines.append(f"[{bucket}] {text}")
-        if index + 1 < len(pieces):
-            time.sleep(CHUNK_PAUSE_S)
-    return "\n".join(lines)
-
-
 def language_report(samples: np.ndarray) -> tuple[str, str]:
     """The mix line for the caption, and the transcript for a follow-up message.
 
+    Language is decided by reading each chunk in every candidate language and
+    keeping the most confident reading - not by an acoustic classifier. The
+    acoustic identifier still runs, but only so the two can be compared in the
+    log: on this speaker's audio it scatters across unrelated languages while the
+    transcriber's confidence stays meaningful.
+
     Pulled out of process() so the self-test exercises the same code path a real
     message takes. Loading a model successfully proves very little about the
-    wiring around it - the failure that prompted this was in process(), on a
-    branch the self-test never touched.
+    wiring around it.
     """
     if transcribe_mode() != "on":
         return "", ""
 
-    lid_windows = language_windows(load_lid(), samples)
-    seconds = language_mix(lid_windows)
-    total = sum(seconds.values())
-    if not total:
-        log.info("language windows: none")
+    # Comparison only. Never used to decide anything.
+    try:
+        log.info("acoustic labels: %s", raw_labels(language_windows(load_lid(), samples)))
+    except Exception as error:
+        log.warning("acoustic labelling failed: %s", describe(error))
+
+    keys = groq_keys()
+    if not keys:
+        log.info("language mix skipped: no key configured")
         return "", ""
 
+    step = int(CHUNK_S * SAMPLE_RATE)
+    floor = int(MIN_CHUNK_S * SAMPLE_RATE)
+    pieces = [samples[index: index + step] for index in range(0, len(samples), step)]
+    pieces = [piece for piece in pieces if len(piece) >= floor][:MAX_CHUNKS]
+    if not pieces:
+        log.info("language mix: nothing long enough to read")
+        return "", ""
+
+    seconds: dict[str, float] = {}
+    lines: list[str] = []
+    for piece in pieces:
+        bucket, _, text = decide_chunk(keys, piece)
+        seconds[bucket] = seconds.get(bucket, 0.0) + len(piece) / SAMPLE_RATE
+        # Beary has no model that can read it, so it is labelled and left alone
+        # rather than turned into confident nonsense - which also saves the call.
+        lines.append(f"[{bucket}] {text}" if text else f"[{bucket}] (not transcribed)")
+
+    total = sum(seconds.values())
     mix_line = " | " + " ".join(
         f"{name} {value / total * 100:.0f}%"
         for name, value in sorted(seconds.items(), key=lambda item: -item[1])
     )
-    log.info("language windows over %.1f s: %s", total, raw_labels(lid_windows))
-
-    keys = groq_keys()
-    if not keys:
-        log.info("transcript skipped: no key configured")
-        return mix_line, ""
-    return mix_line, transcribe(keys, samples, lid_windows)
+    log.info("language mix over %.1f s in %d chunk(s):%s", total, len(pieces), mix_line)
+    return mix_line, "\n".join(lines)
 
 
 def windows(run: tuple[float, float], total_s: float) -> list[tuple[float, float]]:
