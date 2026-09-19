@@ -108,6 +108,16 @@ REPETITION_FLOOR = 0.40  # unique-word ratio below this means the model was loop
 LID_WINDOW_S = 3.0
 LID_HOP_S = 1.5
 MIN_LID_S = 1.0
+# How much of its probability mass the identifier must put on a candidate before
+# its vote counts for anything. The model has 107 classes, so a uniform guess is
+# about 0.01, and a reading near that is the model declining to answer rather
+# than answering. Observed real readings sit at 0.33-1.00 and observed
+# non-answers at 0.00-0.09, so the floor sits in the gap. Without it, a chunk
+# whose windows scored 0.00 against 0.00 was still being decided by whichever
+# candidate won on the third decimal place - which quietly overrode a confident
+# English reading and turned an English chunk into Arabic, with nothing in the
+# log to say the vote had been a coin toss between two non-answers.
+LID_MASS_FLOOR = 0.25
 LANGUAGE_BUCKETS = {"ar": "Arabic", "en": "English"}
 OTHER_BUCKET = "Beary / other"
 
@@ -629,6 +639,11 @@ def preferred_language(
     inside a chunk can land on a pause and name the wrong language for the whole
     chunk. The reading is what makes a wrong call diagnosable: it shows whether
     the vote was lopsided or a coin toss, which a bare winner cannot.
+
+    Returns no preference when the vote is a tie, or when neither candidate drew
+    LID_MASS_FLOOR of the mass. Both are cases where the identifier has not
+    actually named a language, and in both the caller falls back to the
+    transcriber's own confidence.
     """
     if not windows:
         return None, "no reading"
@@ -645,8 +660,16 @@ def preferred_language(
     )
     first, second = LANGUAGE_CANDIDATES
     if totals[first] == totals[second]:
-        return None, reading
-    return max(LANGUAGE_CANDIDATES, key=lambda code: totals[code]), reading
+        return None, f"{reading} (tie)"
+
+    winner = max(LANGUAGE_CANDIDATES, key=lambda code: totals[code])
+    # A vote nobody can win is not a vote. If the identifier put no mass on
+    # either candidate, it is saying "not one of these" - which is what Beary
+    # looks like - and the third decimal place must not then pick a language.
+    # The fallback is the transcriber's own confidence, i.e. the old behaviour.
+    if totals[winner] / len(windows) < LID_MASS_FLOOR:
+        return None, f"{reading} (no candidate recognised)"
+    return winner, reading
 
 
 def raw_labels(windows: list[tuple[float, float, str, float, dict[str, float]]]) -> str:
@@ -849,7 +872,41 @@ def enroll(token: str, chat_id: str, file_id: str) -> int:
 # Entry point
 # --------------------------------------------------------------------------- #
 
-def process(token: str, chat_id: str, file_id: str, reference: np.ndarray, threshold: float, kind: str = "voice") -> int:
+CLEAN_SUFFIX = "-clean"
+
+
+def cleaned_name(file_name: str) -> str:
+    """The name to give the cleaned audio: the original, suffixed.
+
+    The name arrives from whoever uploaded the file, so it is treated as
+    untrusted and is never logged. Only the base name survives, anything outside
+    letters, digits, dot, dash and underscore becomes an underscore, and the
+    length is capped - a name carrying a path separator or a control character
+    would otherwise be interpolated into a multipart header. A name that
+    survives none of that falls back to a fixed one, because Telegram rejects a
+    document sent with an empty filename.
+
+    The suffix is what keeps a cleaned file distinguishable from the original
+    once a day's uploads are all sitting in the same chat.
+    """
+    base = Path(str(file_name or "")).name
+    stem = Path(base).stem if base else ""
+    extension = Path(base).suffix if base else ""
+    keep = re.sub(r"[^A-Za-z0-9._-]", "_", stem)[:60].strip("._-")
+    if not keep:
+        return f"clip{CLEAN_SUFFIX}.m4a"
+    return f"{keep}{CLEAN_SUFFIX}{extension or '.m4a'}"
+
+
+def process(
+    token: str,
+    chat_id: str,
+    file_id: str,
+    reference: np.ndarray,
+    threshold: float,
+    kind: str = "voice",
+    file_name: str = "",
+) -> int:
     with tempfile.TemporaryDirectory() as workspace:
         root = Path(workspace)
         source, decoded, joined, output = root / "in.bin", root / "in.wav", root / "join.wav", root / "out.m4a"
@@ -928,9 +985,14 @@ def process(token: str, chat_id: str, file_id: str, reference: np.ndarray, thres
         )
 
         if kind == "document":
-            # An automated upload: the user asked for the transcript only, so the
-            # cleaned audio is not sent back. It is still produced, because the
-            # transcript is read from the filtered audio rather than the raw file.
+            # An automated upload. The cleaned audio goes back as well as the
+            # transcript: the runner is thrown away at the end of the job, so the
+            # cleaned file would otherwise exist for a few minutes and then never
+            # again, and Telegram is the only durable copy kept. Sent first and
+            # without a caption, so the file stands on its own suffixed name and
+            # the caption below reads as its summary.
+            if not send_document(token, chat_id, output, "", cleaned_name(file_name)):
+                telegram_text(token, chat_id, "Could not send the cleaned audio.")
             # The caption goes out even when there is no transcript, so a file that
             # was processed is never silent - silence is indistinguishable from a
             # file that was dropped.
@@ -1010,6 +1072,9 @@ def main() -> int:
     # "document" means an automated upload (the watch): transcript only, no audio
     # sent back. Anything else is a hand-sent note and gets the audio too.
     kind = str(dispatch.get("kind") or "voice").strip().lower()
+    # Only ever used to name the outgoing file. It is supplied by whoever uploaded
+    # the recording, so it is never logged - see cleaned_name().
+    file_name = str(dispatch.get("file_name") or "")
     threshold = float(os.environ.get("MATCH_THRESHOLD") or "0.45")
 
     # Re-checked here as well as in the relay: a dispatch can be replayed.
@@ -1038,7 +1103,7 @@ def main() -> int:
         return 1
 
     try:
-        return process(token, chat_id, file_id, reference, threshold, kind)
+        return process(token, chat_id, file_id, reference, threshold, kind, file_name)
     except Exception as error:
         log.warning("processing failed: %s", describe(error))
         telegram_text(token, chat_id, "Processing failed.")

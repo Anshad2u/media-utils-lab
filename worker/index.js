@@ -99,7 +99,7 @@ export default {
       return ok();
     }
 
-    const { media, kind } = picked;
+    const { media, kind, fileName } = picked;
     if (!media.file_id) return ok();
 
     if (media.file_size && media.file_size > MAX_BYTES) {
@@ -107,7 +107,7 @@ export default {
       return ok();
     }
 
-    ctx.waitUntil(dispatch(env, media.file_id, message.chat.id, message.message_id, kind));
+    ctx.waitUntil(dispatch(env, media.file_id, message.chat.id, message.message_id, kind, fileName));
     return ok();
   },
 };
@@ -146,15 +146,26 @@ const AUDIO_EXTENSIONS = [
   ".3gp", ".amr", ".weba", ".aiff", ".aif", ".caf", ".wma", ".m4b",
 ];
 
+/**
+ * The uploader's own filename, or "" when it did not send one.
+ *
+ * Only ever used to name the cleaned file that is sent back, and never logged.
+ * Kept in its original case - the lowercased copy inside pickMedia exists only
+ * so that the extension test is case-insensitive.
+ */
+function originalName(media) {
+  return typeof media.file_name === "string" ? media.file_name : "";
+}
+
 function pickMedia(message) {
-  if (message.voice) return { media: message.voice, kind: "voice" };
-  if (message.audio) return { media: message.audio, kind: "audio" };
+  if (message.voice) return { media: message.voice, kind: "voice", fileName: "" };
+  if (message.audio) return { media: message.audio, kind: "audio", fileName: originalName(message.audio) };
   const doc = message.document;
   if (!doc) return null;
   const mime = typeof doc.mime_type === "string" ? doc.mime_type.toLowerCase() : "";
   const name = typeof doc.file_name === "string" ? doc.file_name.toLowerCase() : "";
   if (mime.startsWith("audio/") || AUDIO_EXTENSIONS.some((ext) => name.endsWith(ext))) {
-    return { media: doc, kind: "document" };
+    return { media: doc, kind: "document", fileName: originalName(doc) };
   }
   return null;
 }
@@ -218,10 +229,12 @@ async function upload(request, env, ctx, url) {
   let fileId = "";
   let chatId = env.TELEGRAM_CHAT_ID;
   let messageId = null;
+  let fileName = "";
   try {
     const message = JSON.parse(text).result || {};
     const media = message.document || message.audio || message.voice || {};
     fileId = media.file_id || "";
+    fileName = originalName(media);
     if (message.chat && message.chat.id) chatId = message.chat.id;
     if (message.message_id) messageId = message.message_id;
   } catch {
@@ -231,14 +244,14 @@ async function upload(request, env, ctx, url) {
   // The recording is safely inside Telegram by now, so a failed dispatch must NOT
   // make the caller think the upload failed - it would send again and the file
   // would arrive twice. Report the dispatch problem to the owner instead.
-  if (fileId) ctx.waitUntil(dispatch(env, fileId, chatId, messageId, "document"));
+  if (fileId) ctx.waitUntil(dispatch(env, fileId, chatId, messageId, "document", fileName));
 
   // Telegram's own status and body, so the caller's existing success check keeps
   // working without changing.
   return new Response(text, { status: response.status, headers: { "Content-Type": "application/json" } });
 }
 
-async function dispatch(env, fileId, chatId, messageId, kind) {
+async function dispatch(env, fileId, chatId, messageId, kind, fileName = "") {
   try {
     const response = await fetch(`https://api.github.com/repos/${env.GITHUB_REPO}/dispatches`, {
       method: "POST",
@@ -252,9 +265,20 @@ async function dispatch(env, fileId, chatId, messageId, kind) {
       body: JSON.stringify({
         event_type: "process_audio",
         // `kind` is a fixed word, never user data: an automated upload arrives as
-        // a document and gets a transcript only, a hand-sent voice note also gets
-        // the cleaned audio back.
-        client_payload: { file_id: fileId, chat_id: chatId, message_id: messageId, kind },
+        // a document and gets a transcript plus the cleaned audio, a hand-sent
+        // voice note also gets the cleaned audio back.
+        //
+        // `file_name` is the uploader's own filename, carried so that the cleaned
+        // file can come back suffixed with it. Like the ids above it is per-file
+        // data and must never be logged - which is why the workflow reads this
+        // payload from the event file instead of echoing it into the run log.
+        client_payload: {
+          file_id: fileId,
+          chat_id: chatId,
+          message_id: messageId,
+          kind,
+          file_name: fileName || "",
+        },
       }),
     });
     // 204 is the documented success status for a dispatch.
