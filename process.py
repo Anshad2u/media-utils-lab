@@ -34,7 +34,6 @@ MIN_WINDOW_S = 0.5  # windows shorter than this are padded up to it
 SEGMENT_PAD_S = 0.15  # context added around a kept run
 MERGE_GAP_S = 0.15  # kept runs closer than this are fused
 JOIN_GAP_S = 0.15  # silence inserted between fused runs
-ENHANCE_MAX_S = 900.0  # denoising is skipped above this, to stay inside the job timeout
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("process")
@@ -250,77 +249,6 @@ def embed(encoder, samples: np.ndarray) -> np.ndarray:
     return vector / norm if norm else vector
 
 
-# --------------------------------------------------------------------------- #
-# Enhancement (optional)
-# --------------------------------------------------------------------------- #
-#
-# MetricGAN+ was trained on VoiceBank-DEMAND: additive noise (fans, traffic,
-# hiss, hum, room rumble) on top of a single speaker. That is exactly the case
-# this handles. It is NOT a source separator, so it does not help with music,
-# and it does not help when another person talks at the same time as you -
-# those need Demucs or a separation model, which are far heavier.
-#
-# It is also not lossless. Denoising always reshapes the signal, and pushing it
-# on quiet or already-clean audio makes speech sound slightly processed. That is
-# why it is opt-in and why every failure below degrades instead of failing.
-
-def enhance_mode() -> str:
-    """ENHANCE = off | output | input.
-
-    output - denoise the kept segments only (cheap; the default)
-    input  - denoise everything before detection and matching (slower, and the
-             only mode that can rescue matching when the noise is loud enough
-             to pull your own voice below the threshold)
-    """
-    mode = (os.environ.get("ENHANCE") or "off").strip().lower()
-    return mode if mode in {"off", "output", "input"} else "off"
-
-
-def load_enhancer_safe():
-    """Load the denoiser, or return None. Never raises.
-
-    Enhancement is a quality stage, not a requirement. If the weights will not
-    fetch or the module will not import, the run continues on the raw audio.
-    """
-    try:
-        from speechbrain.inference.enhancement import SpectralMaskEnhancement
-
-        return SpectralMaskEnhancement.from_hparams(
-            source="speechbrain/metricgan-plus-voicebank",
-            savedir=str(Path("pretrained_models") / "metricgan-plus-voicebank"),
-            run_opts={"device": "cpu"},
-        )
-    except Exception as error:
-        log.warning("enhancer unavailable: %s", describe(error))
-        return None
-
-
-def enhance(enhancer, samples: np.ndarray) -> np.ndarray | None:
-    """Denoise 16 kHz mono int16 audio. Returns None if it should not be used."""
-    import torch
-
-    seconds = len(samples) / SAMPLE_RATE
-    if seconds > ENHANCE_MAX_S:
-        log.info("enhancement skipped: %.1f s is over the %.0f s budget", seconds, ENHANCE_MAX_S)
-        return None
-
-    waveform = torch.from_numpy(samples.astype(np.float32) / 32768.0).unsqueeze(0)
-    try:
-        with torch.no_grad():
-            cleaned = enhancer.enhance_batch(waveform, lengths=torch.tensor([1.0]))
-    except Exception as error:
-        log.warning("enhancement failed: %s", describe(error))
-        return None
-
-    # The model emits floats roughly in [-1, 1]; clip before the int16 round trip
-    # so a stray overshoot wraps around into loud noise instead of just clipping.
-    cleaned = np.clip(cleaned.squeeze().cpu().numpy(), -1.0, 1.0)
-    if cleaned.ndim != 1 or cleaned.size == 0:
-        log.warning("enhancement returned an unusable shape")
-        return None
-    return (cleaned * 32767.0).astype(np.int16)
-
-
 def windows(run: tuple[float, float], total_s: float) -> list[tuple[float, float]]:
     start, end = run
     span = end - start
@@ -424,9 +352,7 @@ def enroll(token: str, chat_id: str, file_id: str) -> int:
 # Entry point
 # --------------------------------------------------------------------------- #
 
-def process(
-    token: str, chat_id: str, file_id: str, reference: np.ndarray, threshold: float, mode: str
-) -> int:
+def process(token: str, chat_id: str, file_id: str, reference: np.ndarray, threshold: float) -> int:
     with tempfile.TemporaryDirectory() as workspace:
         root = Path(workspace)
         source, decoded, joined, output = root / "in.bin", root / "in.wav", root / "join.wav", root / "out.m4a"
@@ -439,30 +365,13 @@ def process(
             return 1
 
         original = duration(decoded)
-
-        # Enhancement is a quality stage, never a requirement. Every branch here
-        # falls back to the untouched audio rather than failing the run, and the
-        # caption always states which mode actually ran.
-        applied = "off"
-        working = decoded
-        enhancer = None
-
-        if mode == "input":
-            enhancer = load_enhancer_safe()
-            if enhancer is not None:
-                cleaned = enhance(enhancer, read_wav(decoded))
-                if cleaned is not None:
-                    working = root / "clean.wav"
-                    write_wav(working, cleaned)
-                    applied = "input"
-
-        runs = speech_runs(working)
+        runs = speech_runs(decoded)
         log.info("speech runs detected: %d", len(runs))
         if not runs:
             telegram_text(token, chat_id, "No matching speech found.")
             return 0
 
-        samples = read_wav(working)
+        samples = read_wav(decoded)
         total_s = len(samples) / SAMPLE_RATE
         encoder = load_encoder()
 
@@ -482,25 +391,13 @@ def process(
 
         merged = fuse(kept, total_s)
         kept_seconds = render(samples, merged, joined)
-        final = joined
-
-        if mode == "output":
-            if enhancer is None:
-                enhancer = load_enhancer_safe()
-            if enhancer is not None:
-                cleaned = enhance(enhancer, read_wav(joined))
-                if cleaned is not None:
-                    final = root / "clean.wav"
-                    write_wav(final, cleaned)
-                    applied = "output"
-
-        if kept_seconds <= 0 or not encode(final, output):
+        if kept_seconds <= 0 or not encode(joined, output):
             telegram_text(token, chat_id, "Processing failed.")
             return 1
 
         caption = (
             f"original {original:.1f}s | kept {kept_seconds:.1f}s | "
-            f"{len(merged)} segment(s) | threshold {threshold:.2f} | enhance {applied}"
+            f"{len(merged)} segment(s) | threshold {threshold:.2f}"
         )
         if not send_document(token, chat_id, output, caption):
             telegram_text(token, chat_id, "Could not send the result.")
@@ -514,29 +411,16 @@ def main() -> int:
     token = setting("TELEGRAM_BOT_TOKEN")
 
     if (os.environ.get("SELFTEST") or "").strip().lower() in {"1", "true", "yes"}:
-        # Environment check: prove the models load before trusting a real run.
+        # Environment check: prove the model loads before trusting a real run.
         try:
             encoder = load_encoder()
-            noise = (np.random.default_rng(0).standard_normal(SAMPLE_RATE * 4) * 1000).astype(np.int16)
-            vector = embed(encoder, noise)
+            noise = np.random.default_rng(0).standard_normal(SAMPLE_RATE * 4) * 1000
+            vector = embed(encoder, noise.astype(np.int16))
             log.info("selftest ok, embedding dim %d", vector.shape[0])
+            return 0
         except Exception as error:
             log.warning("selftest failed: %s", describe(error))
             return 1
-
-        mode = enhance_mode()
-        if mode != "off":
-            enhancer = load_enhancer_safe()
-            if enhancer is None:
-                log.warning("selftest failed: enhancer unavailable")
-                return 1
-            cleaned = enhance(enhancer, noise)
-            if cleaned is None:
-                log.warning("selftest failed: enhancement did not complete")
-                return 1
-            log.info("selftest ok, enhance %s, %d samples out", mode, cleaned.shape[0])
-
-        return 0
 
     allowed = setting("ALLOWED_CHAT_ID").strip()
     dispatch = payload()
@@ -570,7 +454,7 @@ def main() -> int:
         return 1
 
     try:
-        return process(token, chat_id, file_id, reference, threshold, enhance_mode())
+        return process(token, chat_id, file_id, reference, threshold)
     except Exception as error:
         log.warning("processing failed: %s", describe(error))
         telegram_text(token, chat_id, "Processing failed.")

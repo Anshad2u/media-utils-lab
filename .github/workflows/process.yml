@@ -23,9 +23,7 @@ concurrency:
 jobs:
   process:
     runs-on: ubuntu-latest
-    # Denoising a long clip on a CPU runner is the slowest step by far, so the
-    # budget is set well above the measured ~2 min for a plain run.
-    timeout-minutes: 45
+    timeout-minutes: 30
 
     steps:
       - name: Check out
@@ -50,9 +48,7 @@ jobs:
             pretrained_models
             ~/.cache/huggingface
             ~/.cache/torch
-          # Bumped when the model set changes: a cache hit is restored but never
-          # re-saved, so without a new key the denoiser would re-download each run.
-          key: models-v2
+          key: models-ecapa-v1
 
       - name: Install CPU-only torch
         run: |
@@ -72,7 +68,6 @@ jobs:
           ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
           VOICE_EMBEDDING: ${{ secrets.VOICE_EMBEDDING }}
           MATCH_THRESHOLD: ${{ vars.MATCH_THRESHOLD }}
-          ENHANCE: ${{ vars.ENHANCE }}
           # The dispatch payload is read from the event file, never from here.
           # The runner echoes every env value into the public log, and the
           # payload carries the file id.
