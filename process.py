@@ -56,7 +56,16 @@ MIN_CHUNK_S = 1.0  # trailing fragments below this are dropped
 # like a language-detection bug. The arithmetic above is the guard against that.
 MAX_CHUNKS = 28
 CHUNK_PAUSE_S = 6.0  # two calls per chunk, paced under the free tier's 20 rpm
-TRANSCRIPT_LIMIT = 3500  # Telegram caps a message at 4096 characters
+# Telegram caps a message at 4096 characters, so this is the most that can be
+# sent inline. It is a fallback now, not the delivery: the full transcript goes
+# out as a .txt document, which has no such limit.
+TRANSCRIPT_LIMIT = 3500
+# The full transcript's filename, and the size past which it cannot be sent.
+# Groq refuses an upload over its own limit with a 413, and a 10 minute file at
+# the encoder's 80k is about 6 MB - so this is a guard against a longer
+# accumulation, not against the normal case.
+TRANSCRIPT_SUFFIX = "-transcript"
+GROQ_MAX_BYTES = 24 * 1024 * 1024
 
 # A chunk is transcribed once per candidate language, and the most confident
 # reading wins. This is content-aware rather than acoustic, which matters here:
@@ -495,6 +504,82 @@ def read_chunk(keys: list[str], samples: np.ndarray, language: str) -> tuple[str
     return None
 
 
+def full_transcript(keys: list[str], audio: Path) -> str:
+    """The whole recording, read in a single pass.
+
+    The per-chunk pass above exists to *decide* a language and a percentage, and
+    it is budgeted to MAX_CHUNKS for exactly that reason. It is not a transcript.
+    It samples, so it can only ever report a fraction of what was said, and it was
+    being handed the kept audio rather than the recording - which is why a ten
+    minute file came back as six lines covering fifty seconds.
+
+    This is the transcript. One call for the whole file, and deliberately no
+    `language`: naming one forces every window into it, and speech the model cannot
+    read is then rendered as confident boilerplate in that language instead of
+    being reported as uncertain. Left to choose, it decides per window, which is
+    the only thing that works on a recording that moves between languages.
+
+    Returns "" on failure, and the caller reads that as "no transcript" rather than
+    as an error. The recording is the deliverable; a spent quota or a bad response
+    must never cost the user their audio.
+    """
+    try:
+        size = audio.stat().st_size if audio.exists() else 0
+    except Exception as error:
+        log.warning("full transcript unreadable: %s", describe(error))
+        return ""
+    if size == 0:
+        return ""
+    if size > GROQ_MAX_BYTES:
+        # Retrying on another key would send the same bytes and get the same 413.
+        log.warning("full transcript skipped: %.1f MB is over the endpoint limit",
+                    size / 1024 / 1024)
+        return ""
+    try:
+        payload = audio.read_bytes()
+    except Exception as error:
+        log.warning("full transcript unreadable: %s", describe(error))
+        return ""
+
+    # Same rotation as read_chunk, for the same reason: always starting at the
+    # first key spends one account's allowance while the other sits idle.
+    global _key_cursor
+    start = _key_cursor % len(keys)
+    _key_cursor += 1
+    for key in keys[start:] + keys[:start]:
+        try:
+            response = requests.post(
+                GROQ_ENDPOINT,
+                headers={"Authorization": f"Bearer {key}"},
+                files={"file": ("recording.m4a", payload, "audio/mp4")},
+                data={"model": GROQ_MODEL, "response_format": "json"},
+                timeout=600,
+            )
+        except Exception as error:
+            log.warning("full transcript request failed: %s", describe(error))
+            continue
+
+        if response.status_code == 200:
+            try:
+                return str(response.json().get("text") or "").strip()
+            except Exception:
+                log.warning("full transcript: unreadable response")
+                continue
+
+        if response.status_code == 413:
+            log.warning("full transcript refused: file too large")
+            return ""
+
+        if response.status_code == 429:
+            log.info("full transcript rate limited, backing off")
+            time.sleep(5.0)
+            continue
+
+        log.warning("full transcript http %s", response.status_code)
+
+    return ""
+
+
 def repetitive(text: str) -> bool:
     """True if a reading looks like the model looping rather than listening.
 
@@ -895,6 +980,22 @@ def enroll(token: str, chat_id: str, file_id: str) -> int:
 CLEAN_SUFFIX = "-clean"
 
 
+def _safe_stem(file_name: str) -> str:
+    """The uploader's name, reduced to something safe to interpolate.
+
+    The name arrives from whoever uploaded the file, so it is treated as
+    untrusted and is never logged. Only the base name survives, anything outside
+    letters, digits, dot, dash and underscore becomes an underscore, and the
+    length is capped - a name carrying a path separator or a control character
+    would otherwise be interpolated into a multipart header. An empty result is
+    the caller's cue to fall back, because Telegram rejects a document sent with
+    an empty filename.
+    """
+    base = Path(str(file_name or "")).name
+    stem = Path(base).stem if base else ""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", stem)[:60].strip("._-")
+
+
 def cleaned_name(file_name: str) -> str:
     """The name to give the cleaned audio: the original, suffixed.
 
@@ -909,13 +1010,21 @@ def cleaned_name(file_name: str) -> str:
     The suffix is what keeps a cleaned file distinguishable from the original
     once a day's uploads are all sitting in the same chat.
     """
-    base = Path(str(file_name or "")).name
-    stem = Path(base).stem if base else ""
-    extension = Path(base).suffix if base else ""
-    keep = re.sub(r"[^A-Za-z0-9._-]", "_", stem)[:60].strip("._-")
+    keep = _safe_stem(file_name)
     if not keep:
         return f"clip{CLEAN_SUFFIX}.m4a"
+    extension = Path(Path(str(file_name or "")).name).suffix
     return f"{keep}{CLEAN_SUFFIX}{extension or '.m4a'}"
+
+
+def transcript_name(file_name: str) -> str:
+    """The full transcript's name, built from the same uploader-supplied stem.
+
+    Sanitised identically to the cleaned audio so the two sort together in the
+    chat, and with a fixed .txt because the body is text whatever the recording
+    happened to be.
+    """
+    return f"{_safe_stem(file_name) or 'clip'}{TRANSCRIPT_SUFFIX}.txt"
 
 
 def process(
@@ -930,6 +1039,9 @@ def process(
     with tempfile.TemporaryDirectory() as workspace:
         root = Path(workspace)
         source, decoded, joined, output = root / "in.bin", root / "in.wav", root / "join.wav", root / "out.m4a"
+        # The whole recording re-encoded small enough to send in one transcription
+        # call, and the transcript itself.
+        full, text_out = root / "full.m4a", root / "transcript.txt"
 
         if not download(token, file_id, source):
             telegram_text(token, chat_id, "Could not fetch that file.")
@@ -1014,11 +1126,42 @@ def process(
             # the caption below reads as its summary.
             if not send_document(token, chat_id, output, "", cleaned_name(file_name)):
                 telegram_text(token, chat_id, "Could not send the cleaned audio.")
-            # The caption goes out even when there is no transcript, so a file that
-            # was processed is never silent - silence is indistinguishable from a
-            # file that was dropped.
-            body = transcript[:TRANSCRIPT_LIMIT]
-            telegram_text(token, chat_id, f"{caption}\n\n{body}" if body else caption)
+
+            # The full transcript, over the whole recording rather than over the
+            # kept audio. The sampled pass above is a language census, not a
+            # transcript: it reads at most MAX_CHUNKS chunks, so on a ten minute
+            # file it could only ever describe a fraction of what was said. This
+            # is the part that answers "what did they actually say".
+            whole = ""
+            if transcribe_mode() == "on":
+                try:
+                    if encode(decoded, full):
+                        whole = full_transcript(groq_keys(), full)
+                except Exception as error:
+                    log.warning("full transcript failed: %s", describe(error))
+
+            if whole:
+                # A document rather than a message: Telegram caps a message at
+                # 4096 characters, which a ten minute transcript passes easily,
+                # and the cap was silently cutting the tail off every one.
+                text_out.write_text(
+                    f"{whole}\n\n"
+                    f"---\n"
+                    f"sampled chunks, with the language each was read as. The full\n"
+                    f"transcript above carries no per-line label.\n\n"
+                    f"{transcript}\n",
+                    encoding="utf-8",
+                )
+                if not send_document(token, chat_id, text_out, caption,
+                                    transcript_name(file_name), "text/plain"):
+                    telegram_text(token, chat_id, "Could not send the transcript.")
+            else:
+                # No full transcript - a spent quota, or the call failed. The
+                # caption still goes out with whatever the sampled pass produced,
+                # because a file that was processed must never be silent: silence
+                # is indistinguishable from a file that was dropped.
+                body = transcript[:TRANSCRIPT_LIMIT]
+                telegram_text(token, chat_id, f"{caption}\n\n{body}" if body else caption)
         else:
             if not send_document(token, chat_id, output, caption):
                 telegram_text(token, chat_id, "Could not send the result.")
