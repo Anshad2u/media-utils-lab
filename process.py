@@ -54,7 +54,9 @@ TRANSCRIPT_LIMIT = 3500  # Telegram caps a message at 4096 characters
 # Beary looks like to it.
 LANGUAGE_CANDIDATES = ("ar", "en")
 LANGUAGE_FLOOR = -0.80  # below this, the reading is not credible
+LANGUAGE_MARGIN = 0.15  # the winner must beat the runner-up by this much
 SILENCE_CEILING = 0.60  # no_speech_prob above this means there was nothing to read
+REPETITION_FLOOR = 0.40  # unique-word ratio below this means the model was looping
 
 # Language identification runs locally, so it is free and can be as fine grained
 # as we like. Whisper's own `language` field is deliberately NOT used for this:
@@ -387,33 +389,59 @@ def read_chunk(keys: list[str], samples: np.ndarray, language: str) -> tuple[str
     return None
 
 
+def repetitive(text: str) -> bool:
+    """True if a reading looks like the model looping rather than listening.
+
+    Forced to a language it cannot actually hear, Whisper does not return nothing
+    - it returns a short phrase repeated until it fills the window. The user's own
+    Beary came back as "I am recording. I am recording. I am recording.", which is
+    the tell. Real speech does not collapse to a handful of distinct words.
+    """
+    words = re.findall(r"\w+", text.lower())
+    if len(words) < 12:
+        return False
+    return len(set(words)) / len(words) < REPETITION_FLOOR
+
+
 def decide_chunk(keys: list[str], samples: np.ndarray) -> tuple[str, str | None, str]:
     """(bucket, iso code, text) for one chunk.
 
-    Every candidate language gets a reading and the most confident one wins, but
-    only if it clears LANGUAGE_FLOOR. When neither language reads the chunk
-    convincingly the chunk is Beary, and we say so rather than forcing it into
-    whichever language happened to score marginally higher.
+    Every candidate language gets a reading. A reading is discarded if the model
+    found no speech, if it looped, or if it is not credible on its own. The
+    survivor must then beat the runner-up by a clear margin - two readings that
+    are nearly as good as each other mean neither language actually fits, which
+    is exactly what Beary looks like to a model that has neither language.
     """
-    best: tuple[str, float, str] | None = None
+    readings: list[tuple[str, float, str]] = []
     for code in LANGUAGE_CANDIDATES:
         reading = read_chunk(keys, samples, code)
-        if reading is None:
-            continue
-        text, score, silence = reading
-        if silence >= SILENCE_CEILING:
-            continue
-        if best is None or score > best[1]:
-            best = (code, score, text)
+        if reading is not None:
+            text, score, silence = reading
+            if silence >= SILENCE_CEILING:
+                log.info("chunk reading for %s was silent", code)
+            elif repetitive(text):
+                log.info("chunk reading for %s was looping", code)
+            else:
+                readings.append((code, score, text))
         time.sleep(CHUNK_PAUSE_S / len(LANGUAGE_CANDIDATES))
 
-    if best is None:
+    if not readings:
         return OTHER_BUCKET, None, ""
 
-    code, score, text = best
-    # A language code and a float carry no speech content, so this is log-safe.
-    log.info("chunk read as %s at %.2f", code, score)
+    readings.sort(key=lambda item: -item[1])
+    code, score, text = readings[0]
+    runner_up = readings[1][1] if len(readings) > 1 else None
+    # A language code and two floats carry no speech content, so this is log-safe.
+    log.info(
+        "chunk reading: %s at %.2f, next %s",
+        code,
+        score,
+        f"{runner_up:.2f}" if runner_up is not None else "n/a",
+    )
+
     if score < LANGUAGE_FLOOR:
+        return OTHER_BUCKET, None, ""
+    if runner_up is not None and score - runner_up < LANGUAGE_MARGIN:
         return OTHER_BUCKET, None, ""
     return LANGUAGE_BUCKETS[code], code, text
 
