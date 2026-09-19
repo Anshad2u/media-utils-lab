@@ -57,6 +57,13 @@ MIN_LID_S = 1.0
 LANGUAGE_BUCKETS = {"ar": "Arabic", "en": "English"}
 OTHER_BUCKET = "Beary / other"
 
+# A Thai sample that ships with the language model. The self-test classifies it
+# and expects Thai back: a known-answer check. Without one, a language report
+# that is quietly nonsense looks exactly like a language report that works.
+LID_KNOWN_ANSWER_URL = (
+    "https://huggingface.co/speechbrain/lang-id-voxlingua107-ecapa/resolve/main/udhr_th.wav"
+)
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("process")
 
@@ -300,8 +307,13 @@ def groq_keys() -> list[str]:
     ]
 
 
-def transcribe_chunk(keys: list[str], samples: np.ndarray) -> str | None:
-    """Send one chunk and return its text, or None if no key worked."""
+def transcribe_chunk(keys: list[str], samples: np.ndarray, language: str) -> str | None:
+    """Send one chunk and return its text, or None if no key worked.
+
+    `language` is an ISO-639-1 code and is always passed. Left out, the model
+    picks for itself and may decide to answer in English, which silently turns a
+    transcription into a translation.
+    """
     import io
 
     buffer = io.BytesIO()
@@ -317,7 +329,11 @@ def transcribe_chunk(keys: list[str], samples: np.ndarray) -> str | None:
                 GROQ_ENDPOINT,
                 headers={"Authorization": f"Bearer {key}"},
                 files={"file": ("chunk.wav", buffer.getvalue(), "audio/wav")},
-                data={"model": GROQ_MODEL, "response_format": "verbose_json"},
+                data={
+                    "model": GROQ_MODEL,
+                    "response_format": "verbose_json",
+                    "language": language,
+                },
                 timeout=120,
             )
         except Exception as error:
@@ -396,31 +412,47 @@ def language_mix(windows: list[tuple[float, float, str, float]]) -> dict[str, fl
 
 
 def raw_labels(windows: list[tuple[float, float, str, float]]) -> str:
-    """Unfiltered label counts, for the log.
+    """Unfiltered label counts and mean confidence, for the log.
 
-    This is how we find out what Beary is actually being classified as, which is
-    the one thing that cannot be predicted in advance. Language codes carry no
-    speech content, so this is safe in a public log.
+    The confidence is the important half. A model that is out of its depth does
+    not fail loudly - it spreads its answers thinly across unrelated languages at
+    low confidence, which looks like a result and is not one. `af 4@0.12` says
+    "four windows, and the model was guessing". Language codes carry no speech
+    content, so this is safe in a public log.
     """
-    counts: dict[str, int] = {}
-    for _, _, code, _ in windows:
-        counts[code] = counts.get(code, 0) + 1
-    ordered = sorted(counts.items(), key=lambda item: -item[1])
-    return ", ".join(f"{code} {count}" for code, count in ordered) or "none"
+    stats: dict[str, list[float]] = {}
+    for _, _, code, confidence in windows:
+        stats.setdefault(code, []).append(confidence)
+    ordered = sorted(stats.items(), key=lambda item: -len(item[1]))
+    return ", ".join(f"{code} {len(c):d}@{sum(c) / len(c):.2f}" for code, c in ordered) or "none"
 
 
-def dominant_bucket(windows: list[tuple[float, float, str, float]], start_s: float, end_s: float) -> str:
-    """The bucket holding most of the windows inside a span."""
-    counts: dict[str, int] = {}
+def dominant_window(
+    windows: list[tuple[float, float, str, float]], start_s: float, end_s: float
+) -> tuple[str, str | None]:
+    """(bucket, iso code) holding most of the windows inside a span.
+
+    The code is None for anything landing in the other bucket, which is the
+    signal that the span should not be transcribed at all.
+    """
+    counts: dict[tuple[str, str | None], int] = {}
     for window_start, window_end, code, _ in windows:
         if window_start >= start_s - LID_HOP_S and window_end <= end_s + LID_HOP_S:
             bucket = LANGUAGE_BUCKETS.get(code, OTHER_BUCKET)
-            counts[bucket] = counts.get(bucket, 0) + 1
-    return max(counts, key=lambda key: counts[key]) if counts else OTHER_BUCKET
+            key = (bucket, code if bucket != OTHER_BUCKET else None)
+            counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return OTHER_BUCKET, None
+    return max(counts, key=lambda key: counts[key])
 
 
 def transcribe(keys: list[str], samples: np.ndarray, windows) -> str:
-    """Text for the readable languages, each line tagged with its bucket."""
+    """Text for the readable languages, each line tagged with its bucket.
+
+    Only Arabic and English are sent for transcription. Beary has no model that
+    can read it, so a chunk in that bucket is labelled and left alone rather than
+    turned into confident nonsense - and it saves the API call.
+    """
     step = int(CHUNK_S * SAMPLE_RATE)
     floor = int(MIN_CHUNK_S * SAMPLE_RATE)
     pieces = [samples[index: index + step] for index in range(0, len(samples), step)]
@@ -428,11 +460,18 @@ def transcribe(keys: list[str], samples: np.ndarray, windows) -> str:
 
     lines: list[str] = []
     for index, piece in enumerate(pieces):
-        text = transcribe_chunk(keys, piece)
+        start_s = index * CHUNK_S
+        span = len(piece) / SAMPLE_RATE
+        bucket, code = dominant_window(windows, start_s, start_s + span)
+        if code is None:
+            lines.append(f"[{bucket}] (not transcribed)")
+            continue
+        # Passing the language explicitly is what keeps Arabic in Arabic script.
+        # Without it the model is free to fall back to English and translate,
+        # which is exactly what it did before.
+        text = transcribe_chunk(keys, piece, code)
         if text:
-            start_s = index * CHUNK_S
-            span = len(piece) / SAMPLE_RATE
-            lines.append(f"[{dominant_bucket(windows, start_s, start_s + span)}] {text}")
+            lines.append(f"[{bucket}] {text}")
         if index + 1 < len(pieces):
             time.sleep(CHUNK_PAUSE_S)
     return "\n".join(lines)
@@ -670,6 +709,30 @@ def main() -> int:
                 )
             except Exception as error:
                 log.warning("selftest failed: %s", describe(error))
+                return 1
+
+            # Known-answer test for the identifier itself. A clean Thai sample
+            # must come back as Thai. If it does not, either the model or the way
+            # it is being called is wrong, and every language report is
+            # meaningless - which is precisely the failure that is invisible,
+            # because a confused model still returns confident-looking labels.
+            try:
+                with tempfile.TemporaryDirectory() as workspace:
+                    root = Path(workspace)
+                    raw_file, wav = root / "known.bin", root / "known.wav"
+                    response = requests.get(LID_KNOWN_ANSWER_URL, timeout=120)
+                    response.raise_for_status()
+                    raw_file.write_bytes(response.content)
+                    if not decode(raw_file, wav):
+                        log.warning("selftest failed: could not decode the known-answer sample")
+                        return 1
+                    known = language_windows(load_lid(), read_wav(wav))
+                    log.info("selftest lid known answer (expect th): %s", raw_labels(known))
+                    if "th" not in {code for _, _, code, _ in known}:
+                        log.warning("selftest failed: known-answer sample not identified as Thai")
+                        return 1
+            except Exception as error:
+                log.warning("selftest known answer failed: %s", describe(error))
                 return 1
 
         return 0
