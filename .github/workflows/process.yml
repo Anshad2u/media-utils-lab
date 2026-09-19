@@ -68,6 +68,9 @@ jobs:
           ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
           VOICE_EMBEDDING: ${{ secrets.VOICE_EMBEDDING }}
           MATCH_THRESHOLD: ${{ vars.MATCH_THRESHOLD }}
+          TRANSCRIBE: ${{ vars.TRANSCRIBE }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_API_KEY_2: ${{ secrets.GROQ_API_KEY_2 }}
           # The dispatch payload is read from the event file, never from here.
           # The runner echoes every env value into the public log, and the
           # payload carries the file id.

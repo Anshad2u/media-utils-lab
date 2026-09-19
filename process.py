@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import wave
 from pathlib import Path
 
@@ -34,6 +35,16 @@ MIN_WINDOW_S = 0.5  # windows shorter than this are padded up to it
 SEGMENT_PAD_S = 0.15  # context added around a kept run
 MERGE_GAP_S = 0.15  # kept runs closer than this are fused
 JOIN_GAP_S = 0.15  # silence inserted between fused runs
+
+# Transcription / language mix
+GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_MODEL = "whisper-large-v3-turbo"
+CHUNK_S = 28.0  # kept under Whisper's 30 s window
+MIN_CHUNK_S = 1.0  # trailing fragments below this are dropped
+MAX_CHUNKS = 60  # bounds the API calls one message can trigger (~28 min of speech)
+CHUNK_PAUSE_S = 1.0  # keeps us under the free tier's per-minute request cap
+LANGUAGE_BUCKETS = {"arabic": "Arabic", "english": "English"}
+TRANSCRIPT_LIMIT = 3500  # Telegram caps a message at 4096 characters
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger("process")
@@ -73,6 +84,7 @@ def describe(error: BaseException) -> str:
     text = str(error).replace("\n", " ")
     text = re.sub(r"https?://\S+", "<url>", text)
     text = re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b", "<token>", text)
+    text = re.sub(r"\bgsk_[A-Za-z0-9]{20,}\b", "<key>", text)
     text = re.sub(r"\b[A-Za-z0-9_-]{40,}\b", "<opaque>", text)
     return f"{type(error).__name__}: {text.strip()[:300]}"
 
@@ -249,6 +261,104 @@ def embed(encoder, samples: np.ndarray) -> np.ndarray:
     return vector / norm if norm else vector
 
 
+# --------------------------------------------------------------------------- #
+# Transcription and language mix
+# --------------------------------------------------------------------------- #
+#
+# Whisper handles Arabic and English well. It has no Beary at all, and neither
+# does anything else released - the best available model (SraVaani-1.0) scores
+# 77.8% WER on Bearybashe, which is unusable. So Beary is measured as a bucket
+# rather than transcribed. That is enough for the question that matters here -
+# how much Arabic is actually spoken - and it needs only the language label.
+
+def transcribe_mode() -> str:
+    """TRANSCRIBE = on | off."""
+    value = (os.environ.get("TRANSCRIBE") or "off").strip().lower()
+    return "on" if value in {"1", "true", "yes", "on"} else "off"
+
+
+def groq_keys() -> list[str]:
+    """Both configured keys, primary first, so one running dry falls through."""
+    return [
+        value
+        for value in (
+            (os.environ.get("GROQ_API_KEY") or "").strip(),
+            (os.environ.get("GROQ_API_KEY_2") or "").strip(),
+        )
+        if value
+    ]
+
+
+def transcribe_chunk(keys: list[str], samples: np.ndarray) -> dict | None:
+    """Send one chunk, return {"language", "text"}, or None if no key worked."""
+    import io
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(SAMPLE_RATE)
+        handle.writeframes(samples.astype(np.int16).tobytes())
+
+    for key in keys:
+        try:
+            response = requests.post(
+                GROQ_ENDPOINT,
+                headers={"Authorization": f"Bearer {key}"},
+                files={"file": ("chunk.wav", buffer.getvalue(), "audio/wav")},
+                data={"model": GROQ_MODEL, "response_format": "verbose_json"},
+                timeout=120,
+            )
+        except Exception as error:
+            # describe() strips URLs and long opaque strings, so neither the
+            # endpoint nor the key can reach the public log from here.
+            log.warning("transcription request failed: %s", describe(error))
+            continue
+
+        if response.status_code == 200:
+            try:
+                body = response.json()
+            except Exception:
+                log.warning("transcription: unreadable response")
+                continue
+            return {
+                "language": str(body.get("language") or "").strip().lower(),
+                "text": str(body.get("text") or "").strip(),
+            }
+
+        # 401/403 means the key is dead, 429 means it is spent. Either way the
+        # next key is worth trying before giving up on the chunk.
+        log.warning("transcription http %s", response.status_code)
+
+    return None
+
+
+def language_mix(keys: list[str], samples: np.ndarray) -> tuple[dict[str, float], list[tuple[str, str]]]:
+    """Attribute every second of speech to a language bucket.
+
+    Returns seconds per bucket plus the (bucket, text) of each chunk that gave
+    readable text. Beary lands in "Beary / other" whatever label Whisper guesses,
+    because it has no Beary to guess.
+    """
+    step = int(CHUNK_S * SAMPLE_RATE)
+    floor = int(MIN_CHUNK_S * SAMPLE_RATE)
+    chunks = [samples[index: index + step] for index in range(0, len(samples), step)]
+    chunks = [chunk for chunk in chunks if len(chunk) >= floor][:MAX_CHUNKS]
+
+    seconds: dict[str, float] = {}
+    said: list[tuple[str, str]] = []
+    for index, chunk in enumerate(chunks):
+        result = transcribe_chunk(keys, chunk)
+        if result:
+            bucket = LANGUAGE_BUCKETS.get(result["language"], "Beary / other")
+            seconds[bucket] = seconds.get(bucket, 0.0) + len(chunk) / SAMPLE_RATE
+            if result["text"]:
+                said.append((bucket, result["text"]))
+        if index + 1 < len(chunks):
+            time.sleep(CHUNK_PAUSE_S)
+    return seconds, said
+
+
 def windows(run: tuple[float, float], total_s: float) -> list[tuple[float, float]]:
     start, end = run
     span = end - start
@@ -395,13 +505,39 @@ def process(token: str, chat_id: str, file_id: str, reference: np.ndarray, thres
             telegram_text(token, chat_id, "Processing failed.")
             return 1
 
+        # Language mix. Non-fatal by design: the recording is the deliverable, and
+        # a spent API quota must not cost the user their audio.
+        mix_line, transcript = "", ""
+        if transcribe_mode() == "on":
+            keys = groq_keys()
+            if not keys:
+                log.info("language mix skipped: no key configured")
+            elif kept_seconds > MAX_CHUNKS * CHUNK_S:
+                log.info("language mix skipped: over the chunk budget")
+            else:
+                try:
+                    seconds, said = language_mix(keys, read_wav(joined))
+                    total = sum(seconds.values())
+                    if total:
+                        mix_line = " | " + " ".join(
+                            f"{name} {value / total * 100:.0f}%"
+                            for name, value in sorted(seconds.items(), key=lambda item: -item[1])
+                        )
+                        transcript = "\n".join(f"[{name}] {text}" for name, text in said)
+                        log.info("language mix over %.1f s across %d bucket(s)", total, len(seconds))
+                except Exception as error:
+                    log.warning("language mix failed: %s", describe(error))
+
         caption = (
             f"original {original:.1f}s | kept {kept_seconds:.1f}s | "
-            f"{len(merged)} segment(s) | threshold {threshold:.2f}"
+            f"{len(merged)} segment(s) | threshold {threshold:.2f}{mix_line}"
         )
         if not send_document(token, chat_id, output, caption):
             telegram_text(token, chat_id, "Could not send the result.")
             return 1
+
+        if transcript:
+            telegram_text(token, chat_id, transcript[:TRANSCRIPT_LIMIT])
 
         log.info("finished")
         return 0
