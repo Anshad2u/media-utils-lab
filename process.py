@@ -38,43 +38,62 @@ JOIN_GAP_S = 0.15  # silence inserted between fused runs
 
 # Transcription / language mix
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
-GROQ_MODEL = "whisper-large-v3-turbo"
+# whisper-large-v3, not the turbo variant. Turbo is a pruned model and is weaker
+# on non-English audio, which is exactly where this pipeline needs accuracy. The
+# free tier covers both, and nothing here is latency bound.
+GROQ_MODEL = "whisper-large-v3"
 CHUNK_S = 8.0  # short enough that a chunk rarely spans two languages
 MIN_CHUNK_S = 1.0  # trailing fragments below this are dropped
 # Bounds the API calls one recording can trigger, and it is set by quota, not by
 # taste. Two Groq accounts give 2 x 2,000 = 4,000 audio requests/day. The target
 # volume is ~300 h/month, which at a 10 minute cap is ~60 recordings/day. So the
-# allowance per recording is 4,000 / 60 = 66 calls, and with three candidate
-# languages that is 22 chunks - hence 20, leaving headroom for retries.
+# allowance per recording is 4,000 / 60 = 66 calls, and with two candidate
+# languages that is 33 chunks - hence 32, leaving headroom for retries.
 # Raise this and the daily quota runs out mid-afternoon; the run then reports
 # every chunk as "Beary / other" because every call failed, which looks exactly
 # like a language-detection bug. The arithmetic above is the guard against that.
-MAX_CHUNKS = 20
-CHUNK_PAUSE_S = 6.0  # three calls per chunk, paced under the free tier's 20 rpm
+MAX_CHUNKS = 32
+CHUNK_PAUSE_S = 6.0  # two calls per chunk, paced under the free tier's 20 rpm
 TRANSCRIPT_LIMIT = 3500  # Telegram caps a message at 4096 characters
 
-# A chunk is transcribed once per candidate language, and the more confident
+# A chunk is transcribed once per candidate language, and the most confident
 # reading wins. This is content-aware rather than acoustic, which matters here:
 # the acoustic identifier handles a clean studio sample at 0.95 confidence and
 # still scatters a compressed voice note with an Indian accent across Tamil,
 # Telugu, Malayalam, Urdu and Assamese. The transcriber is far better at accented
-# speech, and the confidence tells us when none of the candidates fit - which is
-# what Beary looks like to it.
+# speech, and its confidence tells us when neither candidate fits - which is what
+# Beary looks like to it.
 #
-# These are the languages the user actually speaks that the model supports. Beary
-# is deliberately absent and must stay absent: the model has no Beary, so a
-# "beary" candidate cannot be passed and could never win a reading anyway. Beary
-# therefore falls through to OTHER_BUCKET by design, which is what we want - it
-# is labelled and left alone rather than forced into Arabic or English.
+# Beary is deliberately absent and must stay absent: the model has no Beary, so a
+# "beary" candidate cannot be passed and could never win a reading. Beary falls
+# through to OTHER_BUCKET by design, which is what we want - labelled and left
+# alone rather than forced into Arabic or English.
 #
-# Hindi was added because leaving it out was not neutral. A Hindi chunk had to be
-# forced into Arabic or English, and whichever won by the margin was reported as
-# real - so some of the Arabic figure was really Hindi. Adding the candidate lets
-# those chunks land correctly instead of inflating a language the user is
-# actually trying to measure.
-LANGUAGE_CANDIDATES = ("ar", "en", "hi")
-LANGUAGE_FLOOR = -0.80  # below this, the reading is not credible
-LANGUAGE_MARGIN = 0.15  # the winner must beat the runner-up by this much
+# Hindi was tried here and has been removed. The reasoning for adding it was sound
+# - an omitted language gets forced into one that is being measured, which corrupts
+# the figure - but the evidence went the other way. On a recording containing no
+# Hindi at all, BOTH Beary chunks were read as Hindi, one of them rendering "Beary"
+# as Devanagari (बेरी). Beary is Dravidian and close enough in sound for the model to
+# prefer it over admitting defeat, so Hindi did not absorb a stray 1% of speech; it
+# stole the very language we are trying to isolate. Two candidates only.
+LANGUAGE_CANDIDATES = ("ar", "en")
+
+# A single gate, replacing the floor-plus-margin pair that was here before.
+#
+# The margin rule required the winner to beat the runner-up by 0.15 and was the
+# largest single source of error. On a real recording it discarded `ar at -0.14` -
+# the most confident reading in the entire file, and correct - purely because `en`
+# scored -0.26. A right answer thrown away for being nearly right twice. The floor
+# alone does what the margin was meant to do.
+#
+# -0.45 is measured, not guessed. From one recording with known ground truth:
+#   real English   -0.17, -0.28, -0.58
+#   real Arabic    -0.14
+#   Beary          -0.50, -0.73   (read as Hindi, which is what exposed this)
+# Real speech lands at -0.58 and above, Beary below. The ranges still overlap, so
+# this is a starting point fitted to six chunks, not a settled value. Every
+# candidate score is logged per chunk precisely so the next run can do better.
+LANGUAGE_FLOOR = -0.45
 SILENCE_CEILING = 0.60  # no_speech_prob above this means there was nothing to read
 REPETITION_FLOOR = 0.40  # unique-word ratio below this means the model was looping
 
@@ -87,7 +106,7 @@ REPETITION_FLOOR = 0.40  # unique-word ratio below this means the model was loop
 LID_WINDOW_S = 3.0
 LID_HOP_S = 1.5
 MIN_LID_S = 1.0
-LANGUAGE_BUCKETS = {"ar": "Arabic", "en": "English", "hi": "Hindi"}
+LANGUAGE_BUCKETS = {"ar": "Arabic", "en": "English"}
 OTHER_BUCKET = "Beary / other"
 
 # A Thai sample that ships with the language model. The self-test classifies it
@@ -440,10 +459,14 @@ def decide_chunk(keys: list[str], samples: np.ndarray) -> tuple[str, str | None,
     """(bucket, iso code, text) for one chunk.
 
     Every candidate language gets a reading. A reading is discarded if the model
-    found no speech, if it looped, or if it is not credible on its own. The
-    survivor must then beat the runner-up by a clear margin - two readings that
-    are nearly as good as each other mean neither language actually fits, which
-    is exactly what Beary looks like to a model that has neither language.
+    found no speech or if it looped. The most confident survivor then has to clear
+    LANGUAGE_FLOOR; below that no candidate really fits and the chunk is left as
+    "other", which is what Beary looks like to a model that has none of its
+    languages.
+
+    There is deliberately no margin requirement here. Requiring the winner to beat
+    the runner-up threw away a correct, highly confident Arabic reading because
+    English scored nearly as well - see the note on LANGUAGE_FLOOR.
     """
     readings: list[tuple[str, float, str]] = []
     for code in LANGUAGE_CANDIDATES:
@@ -462,19 +485,15 @@ def decide_chunk(keys: list[str], samples: np.ndarray) -> tuple[str, str | None,
         return OTHER_BUCKET, None, ""
 
     readings.sort(key=lambda item: -item[1])
-    code, score, text = readings[0]
-    runner_up = readings[1][1] if len(readings) > 1 else None
-    # A language code and two floats carry no speech content, so this is log-safe.
-    log.info(
-        "chunk reading: %s at %.2f, next %s",
-        code,
-        score,
-        f"{runner_up:.2f}" if runner_up is not None else "n/a",
-    )
+    # Log every reading, not just the winner. The thresholds are set from these
+    # numbers, and a winner-plus-runner-up line cannot show what the other
+    # candidates scored - which is exactly the gap that made the last calibration
+    # a guess. A language code and a float carry no speech content, so this is
+    # log-safe.
+    log.info("chunk readings: %s", ", ".join(f"{code} {score:.2f}" for code, score, _ in readings))
 
+    code, score, text = readings[0]
     if score < LANGUAGE_FLOOR:
-        return OTHER_BUCKET, None, ""
-    if runner_up is not None and score - runner_up < LANGUAGE_MARGIN:
         return OTHER_BUCKET, None, ""
     return LANGUAGE_BUCKETS[code], code, text
 
