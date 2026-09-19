@@ -42,7 +42,7 @@ GROQ_MODEL = "whisper-large-v3-turbo"
 CHUNK_S = 8.0  # short enough that a chunk rarely spans two languages
 MIN_CHUNK_S = 1.0  # trailing fragments below this are dropped
 MAX_CHUNKS = 80  # bounds the API calls one message can trigger (~10 min of speech)
-CHUNK_PAUSE_S = 5.0  # two calls per chunk, paced under the free tier's request cap
+CHUNK_PAUSE_S = 7.0  # two calls per chunk, paced under the free tier's 20 rpm cap
 TRANSCRIPT_LIMIT = 3500  # Telegram caps a message at 4096 characters
 
 # A chunk is transcribed once per candidate language, and the more confident
@@ -535,10 +535,21 @@ def language_report(samples: np.ndarray) -> tuple[str, str]:
     step = int(CHUNK_S * SAMPLE_RATE)
     floor = int(MIN_CHUNK_S * SAMPLE_RATE)
     pieces = [samples[index: index + step] for index in range(0, len(samples), step)]
-    pieces = [piece for piece in pieces if len(piece) >= floor][:MAX_CHUNKS]
+    pieces = [piece for piece in pieces if len(piece) >= floor]
     if not pieces:
         log.info("language mix: nothing long enough to read")
         return "", ""
+
+    # Even sampling. Truncating to the first MAX_CHUNKS chunks would describe only
+    # the opening minutes of a long recording, and a note that runs past the
+    # budget used to be skipped outright - which silently reported nothing for
+    # the long notes. Sampling across the whole span keeps the same call budget
+    # while making the figure an estimate of the entire recording.
+    sampled = len(pieces) > MAX_CHUNKS
+    if sampled:
+        stride = len(pieces) / MAX_CHUNKS
+        pieces = [pieces[int(index * stride)] for index in range(MAX_CHUNKS)]
+        log.info("language mix sampled every %.1f chunk(s) across the recording", stride)
 
     seconds: dict[str, float] = {}
     lines: list[str] = []
@@ -550,11 +561,15 @@ def language_report(samples: np.ndarray) -> tuple[str, str]:
         lines.append(f"[{bucket}] {text}" if text else f"[{bucket}] (not transcribed)")
 
     total = sum(seconds.values())
+    # A sampled figure is an estimate over the whole recording, so it is marked
+    # as approximate rather than passed off as a measured breakdown.
+    mark = "~" if sampled else ""
     mix_line = " | " + " ".join(
-        f"{name} {value / total * 100:.0f}%"
+        f"{name} {mark}{value / total * 100:.0f}%"
         for name, value in sorted(seconds.items(), key=lambda item: -item[1])
     )
-    log.info("language mix over %.1f s in %d chunk(s):%s", total, len(pieces), mix_line)
+    log.info("language mix over %.1f s in %d chunk(s)%s:%s",
+             total, len(pieces), " (sampled)" if sampled else "", mix_line)
     return mix_line, "\n".join(lines)
 
 
@@ -708,13 +723,10 @@ def process(token: str, chat_id: str, file_id: str, reference: np.ndarray, thres
         # a spent API quota must not cost the user their audio.
         mix_line, transcript = "", ""
         if transcribe_mode() == "on":
-            if kept_seconds > MAX_CHUNKS * CHUNK_S:
-                log.info("language mix skipped: over the chunk budget")
-            else:
-                try:
-                    mix_line, transcript = language_report(read_wav(joined))
-                except Exception as error:
-                    log.warning("language mix failed: %s", describe(error))
+            try:
+                mix_line, transcript = language_report(read_wav(joined))
+            except Exception as error:
+                log.warning("language mix failed: %s", describe(error))
 
         caption = (
             f"original {original:.1f}s | kept {kept_seconds:.1f}s | "
