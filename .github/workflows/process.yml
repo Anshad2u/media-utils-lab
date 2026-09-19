@@ -16,9 +16,15 @@ permissions:
   contents: read
 
 concurrency:
-  # Queue instead of colliding. Never cancel a run that is mid-upload.
+  # queue: max, NOT cancel-in-progress. These are not two spellings of the same
+  # thing. The default (queue: single) allows only one *pending* run per group,
+  # and a newly queued run cancels the existing pending one - so a burst of
+  # watch uploads would run two files and silently drop every other one, with no
+  # error anywhere. queue: max lets up to 100 runs wait their turn in FIFO
+  # order. It cannot be combined with cancel-in-progress, which is why that key
+  # is gone rather than set to false.
   group: process-audio
-  cancel-in-progress: false
+  queue: max
 
 jobs:
   process:

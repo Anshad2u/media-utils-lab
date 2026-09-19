@@ -709,7 +709,7 @@ def enroll(token: str, chat_id: str, file_id: str) -> int:
 # Entry point
 # --------------------------------------------------------------------------- #
 
-def process(token: str, chat_id: str, file_id: str, reference: np.ndarray, threshold: float) -> int:
+def process(token: str, chat_id: str, file_id: str, reference: np.ndarray, threshold: float, kind: str = "voice") -> int:
     with tempfile.TemporaryDirectory() as workspace:
         root = Path(workspace)
         source, decoded, joined, output = root / "in.bin", root / "in.wav", root / "join.wav", root / "out.m4a"
@@ -765,12 +765,22 @@ def process(token: str, chat_id: str, file_id: str, reference: np.ndarray, thres
             f"original {original:.1f}s | kept {kept_seconds:.1f}s | "
             f"{len(merged)} segment(s) | threshold {threshold:.2f}{mix_line}"
         )
-        if not send_document(token, chat_id, output, caption):
-            telegram_text(token, chat_id, "Could not send the result.")
-            return 1
 
-        if transcript:
-            telegram_text(token, chat_id, transcript[:TRANSCRIPT_LIMIT])
+        if kind == "document":
+            # An automated upload: the user asked for the transcript only, so the
+            # cleaned audio is not sent back. It is still produced, because the
+            # transcript is read from the filtered audio rather than the raw file.
+            # The caption goes out even when there is no transcript, so a file that
+            # was processed is never silent - silence is indistinguishable from a
+            # file that was dropped.
+            body = transcript[:TRANSCRIPT_LIMIT]
+            telegram_text(token, chat_id, f"{caption}\n\n{body}" if body else caption)
+        else:
+            if not send_document(token, chat_id, output, caption):
+                telegram_text(token, chat_id, "Could not send the result.")
+                return 1
+            if transcript:
+                telegram_text(token, chat_id, transcript[:TRANSCRIPT_LIMIT])
 
         log.info("finished")
         return 0
@@ -836,6 +846,9 @@ def main() -> int:
     dispatch = payload()
     chat_id = str(dispatch.get("chat_id") or "").strip()
     file_id = str(dispatch.get("file_id") or "")
+    # "document" means an automated upload (the watch): transcript only, no audio
+    # sent back. Anything else is a hand-sent note and gets the audio too.
+    kind = str(dispatch.get("kind") or "voice").strip().lower()
     threshold = float(os.environ.get("MATCH_THRESHOLD") or "0.45")
 
     # Re-checked here as well as in the relay: a dispatch can be replayed.
@@ -864,7 +877,7 @@ def main() -> int:
         return 1
 
     try:
-        return process(token, chat_id, file_id, reference, threshold)
+        return process(token, chat_id, file_id, reference, threshold, kind)
     except Exception as error:
         log.warning("processing failed: %s", describe(error))
         telegram_text(token, chat_id, "Processing failed.")

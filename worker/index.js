@@ -28,24 +28,43 @@ export default {
     if (!message || !message.chat) return ok();
     if (String(message.chat.id) !== String(env.TELEGRAM_CHAT_ID)) return ok();
 
-    const media = pickMedia(message);
-    if (!media || !media.file_id) return ok();
+    const picked = pickMedia(message);
+    if (!picked) return ok();
+
+    const { media, kind } = picked;
+    if (!media.file_id) return ok();
 
     if (media.file_size && media.file_size > MAX_BYTES) {
       ctx.waitUntil(say(env, message.chat.id, "That file is too large."));
       return ok();
     }
 
-    ctx.waitUntil(dispatch(env, media.file_id, message.chat.id, message.message_id));
+    ctx.waitUntil(dispatch(env, media.file_id, message.chat.id, message.message_id, kind));
     return ok();
   },
 };
 
+/**
+ * Audio only. Returns the media object plus what kind of upload it was, or null.
+ *
+ * An automated recorder (a watch, a phone) uploads .m4a as a *document*, and the
+ * mime type it declares is not dependable - some senders use
+ * application/octet-stream, which would fail a mime-only check and drop the file
+ * with no error anywhere. So accept an audio mime type OR a known audio
+ * filename extension.
+ */
+const AUDIO_EXTENSIONS = [".m4a", ".mp3", ".wav", ".ogg", ".oga", ".opus", ".aac", ".flac"];
+
 function pickMedia(message) {
-  if (message.voice) return message.voice;
-  if (message.audio) return message.audio;
+  if (message.voice) return { media: message.voice, kind: "voice" };
+  if (message.audio) return { media: message.audio, kind: "audio" };
   const doc = message.document;
-  if (doc && typeof doc.mime_type === "string" && doc.mime_type.startsWith("audio/")) return doc;
+  if (!doc) return null;
+  const mime = typeof doc.mime_type === "string" ? doc.mime_type.toLowerCase() : "";
+  const name = typeof doc.file_name === "string" ? doc.file_name.toLowerCase() : "";
+  if (mime.startsWith("audio/") || AUDIO_EXTENSIONS.some((ext) => name.endsWith(ext))) {
+    return { media: doc, kind: "document" };
+  }
   return null;
 }
 
@@ -57,7 +76,7 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
-async function dispatch(env, fileId, chatId, messageId) {
+async function dispatch(env, fileId, chatId, messageId, kind) {
   try {
     const response = await fetch(`https://api.github.com/repos/${env.GITHUB_REPO}/dispatches`, {
       method: "POST",
@@ -70,7 +89,10 @@ async function dispatch(env, fileId, chatId, messageId) {
       },
       body: JSON.stringify({
         event_type: "process_audio",
-        client_payload: { file_id: fileId, chat_id: chatId, message_id: messageId },
+        // `kind` is a fixed word, never user data: an automated upload arrives as
+        // a document and gets a transcript only, a hand-sent voice note also gets
+        // the cleaned audio back.
+        client_payload: { file_id: fileId, chat_id: chatId, message_id: messageId, kind },
       }),
     });
     // 204 is the documented success status for a dispatch.
