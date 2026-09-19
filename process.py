@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -43,6 +44,37 @@ def setting(name: str, default: str | None = None) -> str:
     if not value:
         raise RuntimeError(f"missing configuration: {name}")
     return value
+
+
+def payload() -> dict:
+    """Read the dispatch payload from the event file, not from the environment.
+
+    The runner echoes every env value into the public log, and this payload carries
+    the file id, so it is deliberately kept out of the environment entirely.
+    """
+    path = os.environ.get("EVENT_PATH") or os.environ.get("GITHUB_EVENT_PATH") or ""
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            event = json.load(handle)
+    except Exception:
+        return {}
+    return (event or {}).get("client_payload") or {}
+
+
+def describe(error: BaseException) -> str:
+    """A log-safe summary of an exception.
+
+    These logs are world-readable and exception text routinely embeds URLs - a
+    requests error carries the whole request URL, and a Telegram URL carries the
+    bot token - so URL-shaped text and long opaque strings are stripped first.
+    """
+    text = str(error).replace("\n", " ")
+    text = re.sub(r"https?://\S+", "<url>", text)
+    text = re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b", "<token>", text)
+    text = re.sub(r"\b[A-Za-z0-9_-]{40,}\b", "<opaque>", text)
+    return f"{type(error).__name__}: {text.strip()[:300]}"
 
 
 # --------------------------------------------------------------------------- #
@@ -377,9 +409,23 @@ def process(token: str, chat_id: str, file_id: str, reference: np.ndarray, thres
 
 def main() -> int:
     token = setting("TELEGRAM_BOT_TOKEN")
+
+    if (os.environ.get("SELFTEST") or "").strip().lower() in {"1", "true", "yes"}:
+        # Environment check: prove the model loads before trusting a real run.
+        try:
+            encoder = load_encoder()
+            noise = np.random.default_rng(0).standard_normal(SAMPLE_RATE * 4) * 1000
+            vector = embed(encoder, noise.astype(np.int16))
+            log.info("selftest ok, embedding dim %d", vector.shape[0])
+            return 0
+        except Exception as error:
+            log.warning("selftest failed: %s", describe(error))
+            return 1
+
     allowed = setting("ALLOWED_CHAT_ID").strip()
-    chat_id = (os.environ.get("CHAT_ID") or "").strip()
-    file_id = os.environ.get("FILE_ID") or ""
+    dispatch = payload()
+    chat_id = str(dispatch.get("chat_id") or "").strip()
+    file_id = str(dispatch.get("file_id") or "")
     threshold = float(os.environ.get("MATCH_THRESHOLD") or "0.45")
 
     # Re-checked here as well as in the relay: a dispatch can be replayed.
@@ -396,22 +442,21 @@ def main() -> int:
         # Nothing enrolled yet, so treat this message as the reference recording.
         try:
             return enroll(token, chat_id, file_id)
-        except Exception:
-            log.warning("enrolment failed")
+        except Exception as error:
+            log.warning("enrolment failed: %s", describe(error))
             telegram_text(token, chat_id, "Enrolment failed.")
             return 1
 
     try:
         reference = np.asarray(json.loads(raw_reference), dtype=np.float32)
-    except Exception:
-        log.warning("reference embedding unusable")
+    except Exception as error:
+        log.warning("reference embedding unusable: %s", describe(error))
         return 1
 
     try:
         return process(token, chat_id, file_id, reference, threshold)
-    except Exception:
-        # Tracebacks and exception text can contain URLs, so they stop here.
-        log.warning("processing failed")
+    except Exception as error:
+        log.warning("processing failed: %s", describe(error))
         telegram_text(token, chat_id, "Processing failed.")
         return 1
 

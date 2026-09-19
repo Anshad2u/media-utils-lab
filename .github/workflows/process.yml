@@ -6,6 +6,11 @@ on:
   repository_dispatch:
     types: [process_audio]
   workflow_dispatch:
+    inputs:
+      selftest:
+        description: Load the model and exit, to verify the environment
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -63,8 +68,11 @@ jobs:
           ALLOWED_CHAT_ID: ${{ secrets.ALLOWED_CHAT_ID }}
           VOICE_EMBEDDING: ${{ secrets.VOICE_EMBEDDING }}
           MATCH_THRESHOLD: ${{ vars.MATCH_THRESHOLD }}
-          FILE_ID: ${{ github.event.client_payload.file_id }}
-          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          # The dispatch payload is read from the event file, never from here.
+          # The runner echoes every env value into the public log, and the
+          # payload carries the file id.
+          EVENT_PATH: ${{ github.event_path }}
+          SELFTEST: ${{ inputs.selftest }}
         run: |
           set +x
           python process.py
