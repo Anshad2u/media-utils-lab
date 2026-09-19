@@ -744,7 +744,8 @@ def process(token: str, chat_id: str, file_id: str, reference: np.ndarray, thres
 
         original = duration(decoded)
         runs = speech_runs(decoded)
-        log.info("speech runs detected: %d", len(runs))
+        log.info("speech runs detected: %d, totalling %.1f s",
+                 len(runs), sum(end - start for start, end in runs))
         if not runs:
             telegram_text(token, chat_id, "No matching speech found.")
             return 0
@@ -759,7 +760,19 @@ def process(token: str, chat_id: str, file_id: str, reference: np.ndarray, thres
                 chunk = samples[int(start * SAMPLE_RATE): int(end * SAMPLE_RATE)]
                 if len(chunk) < int(MIN_WINDOW_S * SAMPLE_RATE):
                     continue
-                if float(np.dot(embed(encoder, chunk), reference)) >= threshold:
+                score = float(np.dot(embed(encoder, chunk), reference))
+                # A score, a duration and an offset carry no speech content, so this
+                # is log-safe. Without it the match is the only stage in the pipeline
+                # with no visibility, which is exactly why a recording that keeps
+                # 2.3 s out of 17.6 s cannot be explained from the outside: the count
+                # says something was dropped, never what it scored or how long the
+                # window was - and window length is what makes a short run's
+                # embedding unreliable in the first place.
+                log.info(
+                    "match at %.1fs, %.1fs long: %.3f %s",
+                    start, end - start, score, "keep" if score >= threshold else "drop",
+                )
+                if score >= threshold:
                     kept.append((start, end))
 
         log.info("matching runs: %d", len(kept))
