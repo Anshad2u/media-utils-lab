@@ -251,15 +251,113 @@ async function upload(request, env, ctx, url) {
   return new Response(text, { status: response.status, headers: { "Content-Type": "application/json" } });
 }
 
+/**
+ * The workflow's concurrency group lets 100 runs wait their turn. Past that,
+ * GitHub still answers a dispatch with 204 - it accepts the request, creates the
+ * run, and then fails it immediately with *no jobs at all*. A run with no job
+ * never executes the `notify` step either, so the file is dropped without one
+ * message anywhere. Measured over the last 200 runs, 23 failed exactly that way:
+ * every failure in the window, and roughly a fifth of the real work.
+ *
+ * That is invisible from the dispatch response, which is why this exists: ask how
+ * deep the queue already is before adding to it. The limit sits below the real cap
+ * because several uploads can be in flight at once and each of them reads the same
+ * count.
+ */
+const QUEUE_LIMIT = 90;
+
+/** The headers every GitHub call needs. One definition, so they cannot drift. */
+function githubHeaders(env) {
+  return {
+    Authorization: `Bearer ${env.GITHUB_DISPATCH_TOKEN}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "media-utils-lab",
+  };
+}
+
+/**
+ * How many runs are waiting to start, or null when that cannot be read.
+ *
+ * Both waiting states are counted, because either one alone undercounts: a run
+ * held back by the concurrency group reports `pending`, while a run waiting for a
+ * free runner reports `queued`.
+ *
+ * null means "could not tell", and the caller treats that as permission to go
+ * ahead. A guard that failed closed would turn a GitHub hiccup into a relay that
+ * refuses every upload - a worse outage than the one it prevents.
+ */
+async function queueDepth(env) {
+  let total = 0;
+  for (const status of ["pending", "queued"]) {
+    let response;
+    try {
+      response = await fetch(
+        `https://api.github.com/repos/${env.GITHUB_REPO}/actions/runs?status=${status}&per_page=1`,
+        { headers: githubHeaders(env) },
+      );
+    } catch {
+      return null;
+    }
+    if (response.status !== 200) return null;
+    let body;
+    try {
+      body = await response.json();
+    } catch {
+      return null;
+    }
+    if (typeof body.total_count !== "number") return null;
+    total += body.total_count;
+  }
+  return total;
+}
+
+/**
+ * True at most once per window, so a burst of refused uploads produces one message
+ * instead of one per file - at a hundred files an hour, a message each is the same
+ * noise problem the routine notices had.
+ *
+ * Best effort by design: the cache is per-colo and may miss, and a missed window
+ * only ever means one extra message. It can never cause a silent drop, which is
+ * the failure this whole guard exists to remove.
+ */
+async function firstInWindow(key, seconds) {
+  try {
+    const cache = caches.default;
+    const url = `https://queue-guard.invalid/${key}`;
+    if (await cache.match(url)) return false;
+    await cache.put(
+      url,
+      new Response("1", { headers: { "Cache-Control": `max-age=${seconds}` } }),
+    );
+    return true;
+  } catch {
+    // No cache available. Say it every time rather than not at all.
+    return true;
+  }
+}
+
 async function dispatch(env, fileId, chatId, messageId, kind, fileName = "") {
+  // Refusing here is not a silent drop - it is a file the owner is told about and
+  // can send again, which is the whole difference this makes. Dispatching into a
+  // full queue would lose it without a word.
+  const depth = await queueDepth(env);
+  if (depth !== null && depth >= QUEUE_LIMIT) {
+    if (await firstInWindow("queue-full", 300)) {
+      await say(
+        env,
+        chatId,
+        `The job queue is full (${depth} waiting), so uploads are not being queued. Send them again once it drains.`,
+      );
+    }
+    return;
+  }
+
   try {
     const response = await fetch(`https://api.github.com/repos/${env.GITHUB_REPO}/dispatches`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${env.GITHUB_DISPATCH_TOKEN}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "media-utils-lab",
+        ...githubHeaders(env),
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
