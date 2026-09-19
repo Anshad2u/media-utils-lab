@@ -26,7 +26,21 @@ export default {
 
     const message = update.message || update.edited_message;
     if (!message || !message.chat) return ok();
-    if (String(message.chat.id) !== String(env.TELEGRAM_CHAT_ID)) return ok();
+
+    if (String(message.chat.id) !== String(env.TELEGRAM_CHAT_ID)) {
+      // A message from somewhere other than the owner's chat. Never reply to the
+      // sender - that would confirm the bot is alive - but do tell the owner, in
+      // the owner's own chat. This is how a file sent from a different account or
+      // a different chat becomes visible instead of vanishing, which is exactly
+      // why the watch uploads looked like they had never been sent at all.
+      const shape = describeUpload(message);
+      if (shape) {
+        ctx.waitUntil(
+          say(env, env.TELEGRAM_CHAT_ID, `Message from another chat (id ${message.chat.id}): ${shape}`),
+        );
+      }
+      return ok();
+    }
 
     const picked = pickMedia(message);
     if (!picked) {
@@ -57,7 +71,11 @@ export default {
   },
 };
 
-/** A short, non-sensitive description of an upload, for diagnosing a rejection. */
+/**
+ * A short, non-sensitive description of an upload, for diagnosing a rejection.
+ * Returns "" when there is nothing to describe, so callers can use it as the gate:
+ * a message with no media must not produce a notification.
+ */
 function describeUpload(message) {
   const parts = [];
   for (const field of ["document", "video", "video_note", "audio", "voice"]) {
@@ -69,7 +87,7 @@ function describeUpload(message) {
     if (typeof media.file_name === "string") parts.push(`name=${media.file_name}`);
     if (typeof media.file_size === "number") parts.push(`size=${media.file_size}`);
   }
-  return parts.join(" ") || "unknown";
+  return parts.join(" ");
 }
 
 /**
