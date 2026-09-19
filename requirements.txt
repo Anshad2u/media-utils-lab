@@ -4,3 +4,8 @@ numpy==1.26.4
 requests==2.32.3
 silero-vad==5.1.2
 speechbrain==1.0.2
+
+# speechbrain 1.0.x still calls hf_hub_download(use_auth_token=...), and
+# huggingface_hub removed that argument in 1.0. Without this pin the model fetch
+# raises TypeError and every run fails while loading the encoder.
+huggingface_hub==0.25.2
