@@ -438,6 +438,37 @@ def transcribe(keys: list[str], samples: np.ndarray, windows) -> str:
     return "\n".join(lines)
 
 
+def language_report(samples: np.ndarray) -> tuple[str, str]:
+    """The mix line for the caption, and the transcript for a follow-up message.
+
+    Pulled out of process() so the self-test exercises the same code path a real
+    message takes. Loading a model successfully proves very little about the
+    wiring around it - the failure that prompted this was in process(), on a
+    branch the self-test never touched.
+    """
+    if transcribe_mode() != "on":
+        return "", ""
+
+    lid_windows = language_windows(load_lid(), samples)
+    seconds = language_mix(lid_windows)
+    total = sum(seconds.values())
+    if not total:
+        log.info("language windows: none")
+        return "", ""
+
+    mix_line = " | " + " ".join(
+        f"{name} {value / total * 100:.0f}%"
+        for name, value in sorted(seconds.items(), key=lambda item: -item[1])
+    )
+    log.info("language windows over %.1f s: %s", total, raw_labels(lid_windows))
+
+    keys = groq_keys()
+    if not keys:
+        log.info("transcript skipped: no key configured")
+        return mix_line, ""
+    return mix_line, transcribe(keys, samples, lid_windows)
+
+
 def windows(run: tuple[float, float], total_s: float) -> list[tuple[float, float]]:
     start, end = run
     span = end - start
@@ -587,26 +618,14 @@ def process(token: str, chat_id: str, file_id: str, reference: np.ndarray, thres
         # Language mix. Non-fatal by design: the recording is the deliverable, and
         # a spent API quota must not cost the user their audio.
         mix_line, transcript = "", ""
-        if transcribe_mode() == "on" and kept_seconds <= MAX_CHUNKS * CHUNK_S:
-            try:
-                windows = language_windows(load_lid(), read_wav(joined))
-                seconds = language_mix(windows)
-                total = sum(seconds.values())
-                if total:
-                    mix_line = " | " + " ".join(
-                        f"{name} {value / total * 100:.0f}%"
-                        for name, value in sorted(seconds.items(), key=lambda item: -item[1])
-                    )
-                    log.info("language windows over %.1f s: %s", total, raw_labels(windows))
-                keys = groq_keys()
-                if keys and windows:
-                    transcript = transcribe(keys, read_wav(joined), windows)
-                elif not keys:
-                    log.info("transcript skipped: no key configured")
-            except Exception as error:
-                log.warning("language mix failed: %s", describe(error))
-        elif transcribe_mode() == "on":
-            log.info("language mix skipped: over the chunk budget")
+        if transcribe_mode() == "on":
+            if kept_seconds > MAX_CHUNKS * CHUNK_S:
+                log.info("language mix skipped: over the chunk budget")
+            else:
+                try:
+                    mix_line, transcript = language_report(read_wav(joined))
+                except Exception as error:
+                    log.warning("language mix failed: %s", describe(error))
 
         caption = (
             f"original {original:.1f}s | kept {kept_seconds:.1f}s | "
@@ -638,12 +657,17 @@ def main() -> int:
             return 1
 
         if transcribe_mode() == "on":
-            # Proves the language identifier loads and runs before a real message
-            # depends on it. The labels below are meaningless because the input is
-            # noise, but a failure to load shows up immediately.
+            # Exercises the same helper a real message calls, end to end: the
+            # local identifier, the bucketing, and the transcription round trip.
+            # The input is noise so the labels mean nothing, but a broken code
+            # path shows up here rather than on someone's recording.
             try:
-                windows = language_windows(load_lid(), noise.astype(np.int16))
-                log.info("selftest ok, lid windows %d, labels: %s", len(windows), raw_labels(windows))
+                mix_line, transcript = language_report(noise.astype(np.int16))
+                log.info(
+                    "selftest ok, mix line %d char(s), transcript %d char(s)",
+                    len(mix_line),
+                    len(transcript),
+                )
             except Exception as error:
                 log.warning("selftest failed: %s", describe(error))
                 return 1
