@@ -285,6 +285,28 @@ def read_wav(path: Path) -> np.ndarray:
     return np.frombuffer(frames, dtype=np.int16)
 
 
+def level(path: Path) -> tuple[float, float]:
+    """Peak and RMS of a decoded 16-bit mono wav, in dBFS.
+
+    Two numbers and no content, so this is log-safe - and it is the only way to
+    tell a silent recording apart from a merely quiet one from the outside. The
+    two cases look identical downstream: the detector finds no runs and the
+    pipeline reports "no matching speech", which reads like a matching fault
+    when it may be a recording fault. A peak near the floor means there was
+    never any speech to find; a healthy peak with no runs means the detector's
+    own threshold is the thing to look at.
+    """
+    samples = read_wav(path).astype(np.float64) / 32768.0
+    if samples.size == 0:
+        return -math.inf, -math.inf
+    peak = float(np.max(np.abs(samples)))
+    rms = float(np.sqrt(np.mean(samples ** 2)))
+    return (
+        20.0 * math.log10(peak) if peak > 0 else -math.inf,
+        20.0 * math.log10(rms) if rms > 0 else -math.inf,
+    )
+
+
 def write_wav(path: Path, samples: np.ndarray) -> None:
     with wave.open(str(path), "wb") as handle:
         handle.setnchannels(1)
@@ -743,11 +765,19 @@ def process(token: str, chat_id: str, file_id: str, reference: np.ndarray, thres
             return 1
 
         original = duration(decoded)
+        peak_db, rms_db = level(decoded)
+        log.info("audio: %.1f s, peak %.1f dBFS, rms %.1f dBFS", original, peak_db, rms_db)
+
         runs = speech_runs(decoded)
         log.info("speech runs detected: %d, totalling %.1f s",
                  len(runs), sum(end - start for start, end in runs))
         if not runs:
-            telegram_text(token, chat_id, "No matching speech found.")
+            # "No matching speech" reads like the matcher is at fault, and on an
+            # empty recording it is not. Quoting the level back separates the two
+            # cases for the person who made the recording, without quoting
+            # anything they said.
+            detail = "silent recording" if peak_db < -50 else f"peak {peak_db:.0f} dBFS"
+            telegram_text(token, chat_id, f"No speech found in {original:.0f}s ({detail}).")
             return 0
 
         samples = read_wav(decoded)
