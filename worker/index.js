@@ -60,6 +60,15 @@ export default {
       return ok();
     }
 
+    // A one-tap liveness check. Silent rejection is the whole problem this relay
+    // has: without a command that always answers, "the relay is down" and "the file
+    // was never delivered to it" look identical from inside the chat. Send /ping
+    // and a reply proves the webhook, the worker and the bot token all work.
+    if (typeof message.text === "string" && message.text.trim() === "/ping") {
+      ctx.waitUntil(say(env, message.chat.id, "pong"));
+      return ok();
+    }
+
     const picked = pickMedia(message);
     if (!picked) {
       // An upload we did not recognise is reported back to the chat. This is the
