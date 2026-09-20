@@ -1105,29 +1105,6 @@ def process(
                     kept.append((start, end))
 
         log.info("matching runs: %d", len(kept))
-        if not kept:
-            routine_notice(token, chat_id, kind, "No matching speech found.")
-            return 0
-
-        merged = fuse(kept, total_s)
-        kept_seconds = render(samples, merged, joined)
-        if kept_seconds <= 0 or not encode(joined, output):
-            telegram_text(token, chat_id, "Processing failed.")
-            return 1
-
-        # Language mix. Non-fatal by design: the recording is the deliverable, and
-        # a spent API quota must not cost the user their audio.
-        mix_line, transcript = "", ""
-        if transcribe_mode() == "on":
-            try:
-                mix_line, transcript = language_report(read_wav(joined))
-            except Exception as error:
-                log.warning("language mix failed: %s", describe(error))
-
-        caption = (
-            f"original {original:.1f}s | kept {kept_seconds:.1f}s | "
-            f"{len(merged)} segment(s) | threshold {threshold:.2f}{mix_line}"
-        )
 
         # The whole recording with the dead air removed: every speaker, not just the
         # one that matched. This is what "include everything" means - the kept audio
@@ -1136,10 +1113,65 @@ def process(
         # the same thing, and so the model is never handed long stretches of silence
         # - which is its own source of hallucination, separate from the
         # forced-language one.
+        #
+        # Built first, and independently of the match, because the recording is the
+        # deliverable. A run that found 422 s of speech and matched none of it used
+        # to return before this point and send nothing at all - and silently, since
+        # an automated upload sends no notice for an ordinary result. That is the
+        # one case "include everything" must not lose.
         whole_seconds = render(samples, fuse(runs, total_s), all_wav)
         whole_ok = whole_seconds > 0 and encode(all_wav, all_out)
         if not whole_ok:
-            log.warning("full audio could not be built; sending only the kept audio")
+            log.warning("full audio could not be built")
+
+        # The voice-matched extract. Absent when nothing matched, which is a result
+        # rather than a fault: the full recording still goes out below.
+        merged: list[tuple[float, float]] = []
+        kept_seconds = 0.0
+        if kept:
+            merged = fuse(kept, total_s)
+            kept_seconds = render(samples, merged, joined)
+            if kept_seconds <= 0 or not encode(joined, output):
+                log.warning("kept audio could not be built; sending the full audio only")
+                kept_seconds = 0.0
+        else:
+            log.info("no run matched the reference voice")
+
+        if not kept_seconds and not whole_ok:
+            if kept:
+                # A genuine fault: runs matched, and the audio still could not be
+                # built. Reported for both kinds, because the alternative is a
+                # failure nobody ever learns about.
+                telegram_text(token, chat_id, "Processing failed.")
+                return 1
+            routine_notice(token, chat_id, kind, "No matching speech found.")
+            return 0
+
+        # Language mix. Non-fatal by design: the recording is the deliverable, and
+        # a spent API quota must not cost the user their audio. Read from the kept
+        # audio when there is one, because the question this line answers is "what
+        # languages did I speak"; when nothing matched there is no kept audio, so it
+        # reads the full recording rather than reporting nothing.
+        census = joined if kept_seconds > 0 else all_wav
+        mix_line, transcript = "", ""
+        if transcribe_mode() == "on" and census.exists():
+            try:
+                mix_line, transcript = language_report(read_wav(census))
+            except Exception as error:
+                log.warning("language mix failed: %s", describe(error))
+
+        if kept_seconds > 0:
+            caption = (
+                f"original {original:.1f}s | kept {kept_seconds:.1f}s | "
+                f"{len(merged)} segment(s) | threshold {threshold:.2f}{mix_line}"
+            )
+        else:
+            # No "kept" figure: quoting 0.0 s beside a threshold reads as a failure,
+            # and on a recording where nobody matched the reference it is not one.
+            caption = (
+                f"original {original:.1f}s | no voice match | "
+                f"{whole_seconds:.1f}s of speech | threshold {threshold:.2f}{mix_line}"
+            )
 
         if kind == "document":
             # An automated upload. The cleaned audio goes back as well as the
@@ -1148,7 +1180,9 @@ def process(
             # again, and Telegram is the only durable copy kept. Sent first and
             # without a caption, so the file stands on its own suffixed name and
             # the caption below reads as its summary.
-            if not send_document(token, chat_id, output, "", cleaned_name(file_name)):
+            if kept_seconds > 0 and not send_document(
+                token, chat_id, output, "", cleaned_name(file_name)
+            ):
                 telegram_text(token, chat_id, "Could not send the cleaned audio.")
             if whole_ok and not send_document(token, chat_id, all_out, "", full_name(file_name)):
                 telegram_text(token, chat_id, "Could not send the full audio.")
@@ -1194,9 +1228,19 @@ def process(
                 body = transcript[:TRANSCRIPT_LIMIT]
                 telegram_text(token, chat_id, f"{caption}\n\n{body}" if body else caption)
         else:
-            if not send_document(token, chat_id, output, caption):
-                telegram_text(token, chat_id, "Could not send the result.")
-                return 1
+            # A hand-sent note: someone is waiting on it, so the matched audio goes
+            # back when there is one. When nothing matched, the full recording still
+            # goes back, because the caption on it says "no voice match" - and an
+            # empty reply is the one outcome that cannot be told apart from a broken
+            # pipeline.
+            if kept_seconds > 0:
+                if not send_document(token, chat_id, output, caption):
+                    telegram_text(token, chat_id, "Could not send the result.")
+                    return 1
+            elif whole_ok:
+                if not send_document(token, chat_id, all_out, caption, full_name(file_name)):
+                    telegram_text(token, chat_id, "Could not send the result.")
+                    return 1
             if transcript:
                 telegram_text(token, chat_id, transcript[:TRANSCRIPT_LIMIT])
 
