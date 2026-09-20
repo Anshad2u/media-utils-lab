@@ -1037,6 +1037,63 @@ def full_name(file_name: str) -> str:
     return f"{_safe_stem(file_name) or 'clip'}{FULL_SUFFIX}.m4a"
 
 
+def minute_map(runs: list[tuple[float, float]],
+               mine: list[tuple[float, float]],
+               total_s: float) -> str:
+    """A minute-by-minute picture of where speech was, and where it was yours.
+
+    The transcript says what was said; this says when, and - by separating the
+    seconds that matched the reference voice from the rest - whether the speech
+    in a given minute was the person the recording was made for or somebody
+    else. That distinction is invisible in the text, which is a single stream
+    with no notion of who was talking.
+
+    Only offsets and durations, so it sits alongside a transcript without
+    adding anything the transcript does not already carry.
+
+    Written for a plain-text reader rather than a terminal: fixed columns, no
+    escape codes, and bars short enough not to wrap on a phone.
+    """
+    if not runs or total_s <= 0:
+        return ""
+
+    span = max(1, math.ceil(total_s / 60.0))
+    speech = [0.0] * span
+    voice = [0.0] * span
+
+    for start, end in runs:
+        index = min(span - 1, max(0, int(start // 60.0)))
+        speech[index] += max(0.0, min(end, total_s) - start)
+    for start, end in mine:
+        index = min(span - 1, max(0, int(start // 60.0)))
+        voice[index] += max(0.0, end - start)
+
+    # The caller passes fused runs, which do not overlap, so this should never
+    # bite. Clamp anyway: the two columns come from different lists, and a minute
+    # claiming more of the user's voice than it claims speech is a contradiction
+    # the reader cannot resolve - they cannot tell which column is lying. A
+    # slightly conservative bar is better than a visibly impossible one.
+    for index in range(span):
+        voice[index] = min(voice[index], speech[index])
+
+    peak = max(speech) or 1.0
+    width = 20
+    lines = [
+        "where you spoke, minute by minute",
+        "# is all speech found, + is the part that matched your voice",
+        "",
+        "minute   speech   your voice   all speech            your voice",
+    ]
+    for index in range(span):
+        lines.append(
+            f"{index:>4}-{index + 1:<3}"
+            f"{speech[index]:>7.1f}s{voice[index]:>11.1f}s   "
+            f"{'#' * max(0, round(speech[index] / peak * width)):<{width}}  "
+            f"{'+' * max(0, round(voice[index] / peak * width))}"
+        )
+    return "\n".join(lines) + "\n"
+
+
 def process(
     token: str,
     chat_id: str,
@@ -1209,8 +1266,14 @@ def process(
                 # A document rather than a message: Telegram caps a message at
                 # 4096 characters, which a ten minute transcript passes easily,
                 # and the cap was silently cutting the tail off every one.
+                #
+                # The minute map leads, because it orients the reader before the
+                # text: where the recording was loud, and which parts of it were
+                # actually the voice this pipeline is looking for. Empty when the
+                # recording had no runs, hence the guard rather than a stray blank.
+                profile = minute_map(runs, merged, total_s)
                 text_out.write_text(
-                    f"{whole}\n\n"
+                    f"{profile}\n{whole}\n\n" if profile else f"{whole}\n\n"
                     f"---\n"
                     f"sampled chunks, with the language each was read as. The full\n"
                     f"transcript above carries no per-line label.\n\n"
