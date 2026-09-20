@@ -65,6 +65,7 @@ TRANSCRIPT_LIMIT = 3500
 # the encoder's 80k is about 6 MB - so this is a guard against a longer
 # accumulation, not against the normal case.
 TRANSCRIPT_SUFFIX = "-transcript"
+FULL_SUFFIX = "-full"
 GROQ_MAX_BYTES = 24 * 1024 * 1024
 
 # A chunk is transcribed once per candidate language, and the most confident
@@ -1027,6 +1028,15 @@ def transcript_name(file_name: str) -> str:
     return f"{_safe_stem(file_name) or 'clip'}{TRANSCRIPT_SUFFIX}.txt"
 
 
+def full_name(file_name: str) -> str:
+    """The whole recording's name: every speaker, dead air removed.
+
+    A fixed .m4a rather than the uploaded extension, because this file is always
+    re-encoded here whatever arrived.
+    """
+    return f"{_safe_stem(file_name) or 'clip'}{FULL_SUFFIX}.m4a"
+
+
 def process(
     token: str,
     chat_id: str,
@@ -1039,9 +1049,11 @@ def process(
     with tempfile.TemporaryDirectory() as workspace:
         root = Path(workspace)
         source, decoded, joined, output = root / "in.bin", root / "in.wav", root / "join.wav", root / "out.m4a"
-        # The whole recording re-encoded small enough to send in one transcription
-        # call, and the transcript itself.
-        full, text_out = root / "full.m4a", root / "transcript.txt"
+        # The whole recording with the dead air removed, and the transcript. This
+        # file is both sent back and read for the transcript, so the text and the
+        # audio describe the same thing.
+        all_wav, all_out = root / "all.wav", root / "full.m4a"
+        text_out = root / "transcript.txt"
 
         if not download(token, file_id, source):
             telegram_text(token, chat_id, "Could not fetch that file.")
@@ -1117,6 +1129,18 @@ def process(
             f"{len(merged)} segment(s) | threshold {threshold:.2f}{mix_line}"
         )
 
+        # The whole recording with the dead air removed: every speaker, not just the
+        # one that matched. This is what "include everything" means - the kept audio
+        # answers "what did I say", and this answers "what was said". It is also what
+        # the transcript is read from, so the text and the audio sent back describe
+        # the same thing, and so the model is never handed long stretches of silence
+        # - which is its own source of hallucination, separate from the
+        # forced-language one.
+        whole_seconds = render(samples, fuse(runs, total_s), all_wav)
+        whole_ok = whole_seconds > 0 and encode(all_wav, all_out)
+        if not whole_ok:
+            log.warning("full audio could not be built; sending only the kept audio")
+
         if kind == "document":
             # An automated upload. The cleaned audio goes back as well as the
             # transcript: the runner is thrown away at the end of the job, so the
@@ -1126,6 +1150,8 @@ def process(
             # the caption below reads as its summary.
             if not send_document(token, chat_id, output, "", cleaned_name(file_name)):
                 telegram_text(token, chat_id, "Could not send the cleaned audio.")
+            if whole_ok and not send_document(token, chat_id, all_out, "", full_name(file_name)):
+                telegram_text(token, chat_id, "Could not send the full audio.")
 
             # The full transcript, over the whole recording rather than over the
             # kept audio. The sampled pass above is a language census, not a
@@ -1133,12 +1159,17 @@ def process(
             # file it could only ever describe a fraction of what was said. This
             # is the part that answers "what did they actually say".
             whole = ""
-            if transcribe_mode() == "on":
+            if transcribe_mode() == "on" and whole_ok:
                 try:
-                    if encode(decoded, full):
-                        whole = full_transcript(groq_keys(), full)
+                    whole = full_transcript(groq_keys(), all_out)
                 except Exception as error:
                     log.warning("full transcript failed: %s", describe(error))
+                # A character count carries no speech content, so this is log-safe.
+                # Without it there is no way to tell a transcript that worked from
+                # one that never ran - both leave the log identical, and the run at
+                # 02:22 could not be checked either way for exactly that reason.
+                log.info("full transcript: %d char(s) over %.1f s of speech",
+                         len(whole), whole_seconds)
 
             if whole:
                 # A document rather than a message: Telegram caps a message at
