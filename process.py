@@ -364,12 +364,41 @@ def speech_runs(wav_path: Path) -> list[tuple[float, float]]:
 
     model = load_silero_vad()
     audio = read_audio(str(wav_path), sampling_rate=SAMPLE_RATE)
+    # Both of these were raised from 300/400 on 2026-09-21, after measuring what
+    # the old values produced. Across 1,242 scored windows in 12 recordings, the
+    # window length turned out to be the single strongest predictor of whether the
+    # owner's voice was recognised at all:
+    #
+    #   under 1.0 s   429 windows   1.9% cleared the threshold
+    #   1.0 - 2.0 s   335 windows   9.6%
+    #   2.0 - 4.0 s   333 windows  17.7%
+    #   4.0 - 8.0 s   125 windows  22.4%
+    #   8.0 - 10  s    20 windows  10.0%
+    #
+    # So a third of all the work was going into windows that almost never matched.
+    # The cause was here: min_speech_duration_ms=300 let the detector emit runs as
+    # short as 0.3 s, and min_silence_duration_ms=400 cut runs apart at pauses that
+    # a single speaker makes mid-sentence. Both then arrived at ECAPA as fragments
+    # too short to carry a voiceprint, and windows() padded anything under 0.5 s up
+    # to exactly 0.5 s, which is not enough audio to embed.
+    #
+    # Raising them fuses those fragments back into runs of a few seconds, which is
+    # the band that matches best. It does not push towards long windows: the 8-10 s
+    # band is the second worst, because a long run can span more than one speaker.
+    # MAX_SPEECH_S and WINDOW_S already re-split anything long into ~4 s pieces, so
+    # over-merging here is corrected downstream rather than left to hurt.
+    #
+    # 700 ms is chosen as just above a normal inter-word pause and just below the
+    # gap between two people taking turns, so it joins a sentence without joining a
+    # conversation. It is a guess with a measurement behind it, not a fitted value:
+    # re-check the table above over the next recordings and move it if the 2-4 s
+    # band does not grow.
     stamps = get_speech_timestamps(
         audio,
         model,
         sampling_rate=SAMPLE_RATE,
-        min_speech_duration_ms=300,
-        min_silence_duration_ms=400,
+        min_speech_duration_ms=500,
+        min_silence_duration_ms=700,
         speech_pad_ms=0,
     )
     return [(stamp["start"] / SAMPLE_RATE, stamp["end"] / SAMPLE_RATE) for stamp in stamps]
