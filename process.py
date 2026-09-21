@@ -1113,7 +1113,16 @@ def process(
         text_out = root / "transcript.txt"
 
         if not download(token, file_id, source):
-            telegram_text(token, chat_id, "Could not fetch that file.")
+            # The one cause worth naming. Telegram lets a bot *send* 50 MB but only
+            # *download* 20 MB, so a recording above that size sits in the chat and
+            # is permanently unreadable. The relay refuses those now, so this should
+            # be rare - but "Could not fetch that file." told the owner nothing about
+            # what to do, and on 2026-09-21 that is exactly what a 27.8 MB upload
+            # produced, after a full runner had been spun up to fail.
+            telegram_text(token, chat_id,
+                          "Could not fetch that file from Telegram. If it was a large "
+                          "recording, note that Telegram will not return files over "
+                          "20 MB - record at a lower bitrate.")
             return 1
         if not decode(source, decoded):
             telegram_text(token, chat_id, "Could not decode that file.")
@@ -1121,6 +1130,11 @@ def process(
 
         original = duration(decoded)
         peak_db, rms_db = level(decoded)
+        # The upload's own size, which nothing else in the pipeline reports. Telegram
+        # caps downloads at 20 MB while allowing 50 MB uploads, so this number is the
+        # first thing worth knowing when a fetch fails - and without it the log cannot
+        # separate "too big" from "wrong file id". A byte count carries no speech.
+        log.info("upload: %.1f MB", source.stat().st_size / 1024 / 1024)
         log.info("audio: %.1f s, peak %.1f dBFS, rms %.1f dBFS", original, peak_db, rms_db)
 
         runs = speech_runs(decoded)

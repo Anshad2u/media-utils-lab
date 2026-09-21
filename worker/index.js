@@ -8,6 +8,23 @@
 
 const MAX_BYTES = 19 * 1024 * 1024;
 
+/**
+ * What the owner is told when an upload is over the limit.
+ *
+ * Names the number and the limit, because the recorder has to be changed and the
+ * person reading this is the only one who can change it. "That file is too large."
+ * says nothing about how much too large, and the answer is not "upload less" - a
+ * ten minute voice recording should be one to two megabytes, so a 28 MB one is a
+ * bitrate problem, not a length problem.
+ */
+function tooLarge(bytes) {
+  const mb = (value) => Math.round(value / 1024 / 1024);
+  return `Refused an upload of about ${mb(bytes)} MB: the limit is ${mb(MAX_BYTES)} MB. ` +
+    "Telegram lets a bot send 50 MB but only download 20 MB, so anything larger " +
+    "arrives and can never be read. Record at a lower bitrate - mono, 32-48 kbps " +
+    "is plenty for speech.";
+}
+
 // The uploader's endpoint. A secret path segment rather than a header, because a
 // watch app is unlikely to support custom headers, and it is the pattern Telegram
 // itself recommends for webhooks.
@@ -103,7 +120,7 @@ export default {
     if (!media.file_id) return ok();
 
     if (media.file_size && media.file_size > MAX_BYTES) {
-      ctx.waitUntil(say(env, message.chat.id, "That file is too large."));
+      ctx.waitUntil(say(env, message.chat.id, tooLarge(media.file_size)));
       return ok();
     }
 
@@ -208,14 +225,61 @@ async function upload(request, env, ctx, url) {
     return json({ ok: false, description: "not found" }, 404);
   }
 
+  // Size, before anything else, because this endpoint is the one place a file can
+  // be accepted that the pipeline will never be able to read.
+  //
+  // Telegram's two limits are not the same number, and only the smaller one
+  // matters here: sendDocument takes up to 50 MB, but a bot may only *download*
+  // 20 MB. A 28 MB recording therefore uploads cleanly, appears in the chat, and
+  // then fails at getFile with a 400 - after a runner has been spun up to fail.
+  // Measured on 2026-09-21: a 27.8 MB upload cost a full CI run and produced
+  // "Could not fetch that file." and nothing else.
+  //
+  // MAX_BYTES sits just under 20 MB, and the webhook path has enforced it since
+  // the beginning. This path did not, which is the whole bug.
+  const declared = Number(request.headers.get("content-length") || 0);
+  if (declared > MAX_BYTES) {
+    ctx.waitUntil(say(env, env.TELEGRAM_CHAT_ID, tooLarge(declared)));
+    return json({ ok: false, description: "file too large" }, 413);
+  }
+
   let response;
+  let oversized = false;
+  let seen = 0;
+
+  // Content-Length is checked above because it costs nothing and settles the normal
+  // case before a byte moves. It is not always present, though, and a chunked upload
+  // would otherwise stream straight past the limit - so the body is counted as it
+  // passes too, and the stream is failed the moment it goes over. Telegram then sees
+  // a truncated multipart and stores nothing, which is the outcome we want: no
+  // unreadable file left behind in the chat.
+  const counted = request.body
+    ? request.body.pipeThrough(
+      new TransformStream({
+        transform(chunk, controller) {
+          seen += chunk.byteLength;
+          if (seen > MAX_BYTES) {
+            oversized = true;
+            controller.error(new Error("over the size limit"));
+            return;
+          }
+          controller.enqueue(chunk);
+        },
+      }),
+    )
+    : null;
+
   try {
     response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendDocument`, {
       method: "POST",
       headers: { "Content-Type": request.headers.get("Content-Type") || "" },
-      body: request.body,
+      body: counted,
     });
   } catch {
+    if (oversized) {
+      ctx.waitUntil(say(env, env.TELEGRAM_CHAT_ID, tooLarge(MAX_BYTES + 1)));
+      return json({ ok: false, description: "file too large" }, 413);
+    }
     return json({ ok: false, description: "could not reach Telegram" }, 502);
   }
 
