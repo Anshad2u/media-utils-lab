@@ -26,6 +26,9 @@ from pathlib import Path
 import numpy as np
 import requests
 
+import archive
+from archive import describe
+
 SAMPLE_RATE = 16000
 API_ROOT = "https://api.telegram.org"
 
@@ -166,19 +169,9 @@ def payload() -> dict:
     return (event or {}).get("client_payload") or {}
 
 
-def describe(error: BaseException) -> str:
-    """A log-safe summary of an exception.
-
-    These logs are world-readable and exception text routinely embeds URLs - a
-    requests error carries the whole request URL, and a Telegram URL carries the
-    bot token - so URL-shaped text and long opaque strings are stripped first.
-    """
-    text = str(error).replace("\n", " ")
-    text = re.sub(r"https?://\S+", "<url>", text)
-    text = re.sub(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b", "<token>", text)
-    text = re.sub(r"\bgsk_[A-Za-z0-9]{20,}\b", "<key>", text)
-    text = re.sub(r"\b[A-Za-z0-9_-]{40,}\b", "<opaque>", text)
-    return f"{type(error).__name__}: {text.strip()[:300]}"
+# describe() lives in archive.py. It is the sanitiser every log line here
+# depends on, and it is shared with digest.py so there is exactly one copy of it
+# to keep correct.
 
 
 # --------------------------------------------------------------------------- #
@@ -1131,9 +1124,9 @@ def archive_transcript(text: str, metrics: dict, stamp: float) -> None:
     """Copy one transcript into the private archive, when one is configured.
 
     Optional on purpose, and completely inert without configuration. The
-    pipeline's job is to deliver the recording, so a missing bucket, a wrong key
-    or a bad network must never cost the user their audio or their transcript.
-    Every failure here is therefore logged and swallowed.
+    pipeline's job is to deliver the recording, so a missing repository, a
+    rejected key or a bad network must never cost the user their audio or their
+    transcript. Every failure here is therefore logged and swallowed.
 
     This exists because delivery is not storage. The transcripts go out over
     Telegram, and a bot cannot read back the messages it sent: getUpdates carries
@@ -1142,58 +1135,43 @@ def archive_transcript(text: str, metrics: dict, stamp: float) -> None:
     minutes and then nowhere at all - which is exactly why "give me today's
     transcript" could not be answered for a day that had already passed.
 
+    The archive is a private repository written with a deploy key scoped to it
+    alone. It is not the public pipeline repository: these files are the owner's
+    own speech, and the one property this must never lose is that they are not
+    readable by anybody else.
+
     Keys are UTC. The digest applies the local offset when it reads, so the day
     boundary is decided in one place and can be changed later without rewriting
     anything already stored.
 
     Nothing here is safe to print, so nothing is printed: not the text, not the
-    key, not the bucket, not the endpoint. Only a character count.
+    key, not the repository, not the commit. Only a character count.
     """
-    account = os.environ.get("R2_ACCOUNT_ID", "").strip()
-    key_id = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
-    secret = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
-    bucket = os.environ.get("R2_BUCKET", "").strip()
-    if not (account and key_id and secret and bucket):
-        return
-
-    try:
-        import boto3
-        from botocore.config import Config
-    except Exception as error:
-        log.warning("archive skipped: %s", describe(error))
+    repo, key = archive.settings()
+    if not repo:
         return
 
     moment = time.gmtime(stamp)
+    day = time.strftime("%Y-%m-%d", moment)
     # The run id separates two recordings processed inside the same second, which
     # happens when a burst clears the queue quickly.
     run = os.environ.get("GITHUB_RUN_ID", "").strip() or str(int(stamp))
-    key = (f"transcripts/{time.strftime('%Y-%m-%d', moment)}/"
-           f"{time.strftime('%H%M%S', moment)}-{run}.txt")
+    stem = f"{time.strftime('%H%M%S', moment)}-{run}"
 
-    try:
-        client = boto3.client(
-            "s3",
-            endpoint_url=f"https://{account}.r2.cloudflarestorage.com",
-            aws_access_key_id=key_id,
-            aws_secret_access_key=secret,
-            region_name="auto",
-            config=Config(retries={"max_attempts": 3, "mode": "standard"},
-                          connect_timeout=10, read_timeout=20),
-        )
-        client.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=text.encode("utf-8"),
-            ContentType="text/plain; charset=utf-8",
-            # Read back by the digest to total the day without downloading every
-            # object. S3 metadata is not typed and travels in headers, so every
-            # value is a string and every key is plain ascii. No file name is
-            # stored: it comes from Telegram and nothing here needs it.
-            Metadata={name: str(value) for name, value in metrics.items()},
-        )
-        log.info("archived transcript: %d char(s)", len(text))
-    except Exception as error:
-        log.warning("archive failed: %s", describe(error))
+    # Two attempts, because the only realistic failure is a push losing a race
+    # against another run, and the second attempt starts from a fresh clone. The
+    # workflow serialises its own runs, so this covers the case where that is
+    # not enough - a manual run beside a dispatched one, say.
+    for attempt in (1, 2):
+        try:
+            with tempfile.TemporaryDirectory() as workspace:
+                if archive.commit(log, Path(workspace), repo, key, day, stem,
+                                  text, metrics, stamp):
+                    log.info("archived transcript: %d char(s)", len(text))
+                    return
+        except Exception as error:
+            log.warning("archive attempt %d failed: %s", attempt, describe(error))
+    log.warning("archive gave up after two attempts; the transcript was still delivered")
 
 
 def process(

@@ -10,9 +10,8 @@ speechbrain==1.0.2
 # raises TypeError and every run fails while loading the encoder.
 huggingface_hub==0.25.2
 
-# Only used by archive_transcript(), which is inert unless the R2 secrets are
-# set. It is listed here rather than installed on demand because the archive is
-# the one thing in the pipeline whose failure is silent by design: a missing
-# module would just mean transcripts quietly stop being kept. Importing it lazily
-# inside the function keeps a misconfigured archive from breaking delivery.
-boto3==1.35.36
+# The transcript archive is written with git over ssh, against a private
+# repository, using the deploy key in ARCHIVE_SSH_KEY. Both are present on the
+# ubuntu-latest image, so there is no archive-specific dependency to install -
+# which is the point: nothing in this file can make the archive silently stop
+# working, and nothing here needs a credential.

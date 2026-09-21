@@ -32,14 +32,21 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import re
 import sys
+import tempfile
+from pathlib import Path
 
 import requests
 
+import archive
+
 API_ROOT = "https://api.telegram.org"
-KEY = re.compile(r"^transcripts/(\d{4}-\d{2}-\d{2})/(\d{2})(\d{2})(\d{2})-[^/]+\.txt$")
+# "140512-35555043181.txt" - UTC time of day, then the run id, under a UTC date
+# directory. archive.py decides this shape; this only has to read it.
+NAME = re.compile(r"^(\d{2})(\d{2})(\d{2})-[^/]+\.txt$")
 
 # A day that produced more than this is not a day, it is a bug - and Telegram
 # would refuse it anyway. Truncate rather than fail, and say so in the document.
@@ -58,29 +65,9 @@ def configured() -> bool:
     anyone has set the secrets up yet, and a job that fails nightly and sends a
     failure notice for a feature nobody has switched on is worse than no feature:
     it trains the owner to ignore the one channel that is supposed to mean
-    something. The archive in process.py is inert the same way, so the two agree.
+    something. The archive in archive.py is inert the same way, so the two agree.
     """
-    return all(env(name) for name in (
-        "R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"))
-
-
-def client():
-    import boto3
-    from botocore.config import Config
-
-    account = env("R2_ACCOUNT_ID")
-    bucket = env("R2_BUCKET")
-    if not (account and bucket):
-        sys.exit("R2_ACCOUNT_ID and R2_BUCKET are required")
-    return boto3.client(
-        "s3",
-        endpoint_url=f"https://{account}.r2.cloudflarestorage.com",
-        aws_access_key_id=env("R2_ACCESS_KEY_ID"),
-        aws_secret_access_key=env("R2_SECRET_ACCESS_KEY"),
-        region_name="auto",
-        config=Config(retries={"max_attempts": 3, "mode": "standard"},
-                      connect_timeout=10, read_timeout=30),
-    ), bucket
+    return bool(archive.settings()[0])
 
 
 def window(day: dt.date, offset: int) -> tuple[dt.datetime, dt.datetime]:
@@ -89,48 +76,78 @@ def window(day: dt.date, offset: int) -> tuple[dt.datetime, dt.datetime]:
     return start, start + dt.timedelta(days=1)
 
 
-def collect(s3, bucket: str, start: dt.datetime, end: dt.datetime) -> list[dict]:
-    """Every archived transcript whose own timestamp falls inside the window."""
-    prefixes = set()
+def utc_days(start: dt.datetime, end: dt.datetime) -> list[str]:
+    """Every UTC date directory the window can reach into.
+
+    The window is local, the directories are UTC, so one local day can touch two
+    of them. Stepping in twelve-hour increments covers a window of any length
+    without arithmetic that has to be right about month ends.
+
+    The last instant is `end` minus a second, not `end` itself: the window is
+    half-open, so nothing is ever stored at `end`, and naming that directory
+    would check out a folder that cannot contribute a file.
+    """
+    days = set()
+    last = end - dt.timedelta(seconds=1)
     cursor = start
-    while cursor < end:
-        prefixes.add(f"transcripts/{cursor:%Y-%m-%d}/")
+    while cursor <= last:
+        days.add(f"{cursor:%Y-%m-%d}")
         cursor += dt.timedelta(hours=12)
+    days.add(f"{last:%Y-%m-%d}")
+    return sorted(days)
 
+
+def collect(work: Path, start: dt.datetime, end: dt.datetime) -> list[dict]:
+    """Every archived transcript whose own timestamp falls inside the window.
+
+    The directory name is not trusted as the timestamp: a file's date prefix is
+    UTC and the window is local, so the name is parsed and the result is checked
+    against the window. That keeps the day boundary in one place, and it means
+    changing LOCAL_TZ later re-groups everything correctly instead of splitting
+    days at a stale line.
+    """
     found: list[dict] = []
-    for prefix in sorted(prefixes):
-        token = None
-        while True:
-            page = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, **(
-                {"ContinuationToken": token} if token else {}))
-            for item in page.get("Contents", []):
-                match = KEY.match(item["Key"])
-                if not match:
-                    continue
-                stamp = dt.datetime(
-                    int(match.group(1)[:4]), int(match.group(1)[5:7]), int(match.group(1)[8:10]),
-                    int(match.group(2)), int(match.group(3)), int(match.group(4)),
-                )
-                if start <= stamp < end:
-                    found.append({"key": item["Key"], "stamp": stamp,
-                                  "size": item.get("Size", 0)})
-            if not page.get("IsTruncated"):
-                break
-            token = page.get("NextContinuationToken")
-
+    for folder in sorted((work / archive.DIR).glob("*")):
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.glob("*.txt")):
+            match = NAME.match(path.name)
+            if not match:
+                continue
+            stamp = dt.datetime(
+                int(folder.name[:4]), int(folder.name[5:7]), int(folder.name[8:10]),
+                int(match.group(1)), int(match.group(2)), int(match.group(3)),
+            )
+            if not (start <= stamp < end):
+                continue
+            found.append({
+                "key": f"{archive.DIR}/{folder.name}/{path.name}",
+                "stamp": stamp,
+                "size": path.stat().st_size,
+                "text": path.read_text(encoding="utf-8", errors="replace"),
+                "metrics": metrics_for(path),
+            })
     found.sort(key=lambda entry: entry["stamp"])
     return found
 
 
-def body_and_metrics(s3, bucket: str, key: str) -> tuple[str, dict]:
-    """One object's text and its metrics, in a single request.
+def metrics_for(path: Path) -> dict:
+    """The sidecar written beside a transcript, or {} if it is missing.
 
-    get_object returns the user metadata alongside the body, so the day can be
-    totalled without a separate HEAD for every recording.
+    Missing is not fatal: the document still compiles, and the header simply
+    totals less. A day that cannot be compiled because one sidecar was lost
+    would be a worse outcome than a day with one recording's duration absent.
+
+    The reason is not logged. The exception text carries the path, and the path
+    carries the recording's own UTC timestamp - which is exactly the kind of
+    thing that has no business in a world-readable log.
     """
-    response = s3.get_object(Bucket=bucket, Key=key)
-    text = response["Body"].read().decode("utf-8", "replace")
-    return text, {k.lower(): v for k, v in (response.get("Metadata") or {}).items()}
+    sidecar = path.with_suffix(".json")
+    try:
+        loaded = json.loads(sidecar.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
 
 
 def number(metrics: dict, name: str) -> float:
@@ -205,8 +222,11 @@ def send(token: str, chat_id: str, name: str, document: str, note: str) -> bool:
             files={"document": (name, document.encode("utf-8"), "text/plain")},
             timeout=120,
         )
-    except Exception:
-        print("sendDocument: network error")
+    except Exception as error:
+        # Through the sanitiser, not str(error). A requests failure embeds the
+        # whole request URL, and this one carries the bot token - so the raw
+        # message is the single most dangerous thing this file could print.
+        print(f"sendDocument: {archive.describe(error)}")
         return False
     # The status alone is not proof Telegram accepted it, but the response body
     # can carry the file id, so only the code is reported.
@@ -233,41 +253,50 @@ def main() -> int:
     if not configured():
         # Deliberately silent on Telegram. See configured().
         print("the transcript archive is not configured, so there is nothing to compile")
-        print("set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_BUCKET")
-        print("as repository secrets, and the archive in process.py will start filling it")
+        print("set ARCHIVE_REPO and ARCHIVE_SSH_KEY as repository secrets, and the")
+        print("archive in process.py will start filling it")
         return 0
 
     start, end = window(day, offset)
     print(f"day {day} (local UTC{offset:+d}) -> UTC {start:%Y-%m-%d %H:%M} .. {end:%Y-%m-%d %H:%M}")
 
-    s3, bucket = client()
-    entries = collect(s3, bucket, start, end)
-    print(f"archived transcripts found: {len(entries)}")
+    repo, key = archive.settings()
+    days = utc_days(start, end)
+    with tempfile.TemporaryDirectory() as workspace:
+        work = archive.checkout(print, Path(workspace), repo, key, days)
+        if work is None:
+            # Not the same thing as an empty day, and must not be reported as
+            # one. Exiting non-zero is what makes the workflow's failure notice
+            # fire, which is the only way this becomes visible.
+            sys.exit("could not read the archive; the digest is not a zero-day report")
 
-    if not entries:
-        # Silence would be indistinguishable from a broken digest, and the whole
-        # point of this pipeline is that a gap is never silent.
-        text = f"No recordings were archived for {day}."
-        print(text)
-        if not args.dry_run:
-            token, chat_id = env("TELEGRAM_BOT_TOKEN"), env("ALLOWED_CHAT_ID")
-            if token and chat_id:
-                requests.post(f"{API_ROOT}/bot{token}/sendMessage",
-                              data={"chat_id": chat_id, "text": text}, timeout=30)
-        return 0
+        entries = collect(work, start, end)
+        print(f"archived transcripts found: {len(entries)}")
 
-    total_chars = 0
-    for entry in entries:
-        text, metrics = body_and_metrics(s3, bucket, entry["key"])
-        entry["text"] = text
-        entry["metrics"] = metrics
-        total_chars += len(text)
-        print(f"  {entry['stamp']:%H:%M:%S}Z  {len(text):>7} chars  "
-              f"recorded {number(metrics, 'recorded_s'):.0f}s  "
-              f"voice {number(metrics, 'voice_s'):.0f}s")
+        if not entries:
+            # Silence would be indistinguishable from a broken digest, and the
+            # whole point of this pipeline is that a gap is never silent.
+            text = f"No recordings were archived for {day}."
+            print(text)
+            if not args.dry_run:
+                token, chat_id = env("TELEGRAM_BOT_TOKEN"), env("ALLOWED_CHAT_ID")
+                if token and chat_id:
+                    requests.post(f"{API_ROOT}/bot{token}/sendMessage",
+                                  data={"chat_id": chat_id, "text": text}, timeout=30)
+            return 0
 
-    document, totals = build(day, offset, entries)
+        for entry in entries:
+            metrics = entry["metrics"]
+            print(f"  {entry['stamp']:%H:%M:%S}Z  {len(entry['text']):>7} chars  "
+                  f"recorded {number(metrics, 'recorded_s'):.0f}s  "
+                  f"voice {number(metrics, 'voice_s'):.0f}s")
 
+        document, totals = build(day, offset, entries)
+
+    # Everything below works from the document in memory, so the working copy is
+    # gone by this point. Deliberately: the clone holds a credential, and the
+    # window in which that credential exists on disk should be as short as it
+    # can be while still doing the job.
     truncated = False
     if len(document) > MAX_CHARS:
         document = document[:MAX_CHARS] + "\n\n[truncated: the day exceeded the size cap]\n"
