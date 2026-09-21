@@ -50,6 +50,20 @@ def env(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
 
 
+def configured() -> bool:
+    """Whether an archive exists to read.
+
+    Checked before anything else so that an unconfigured repository is quiet
+    rather than broken. The scheduled run happens every night whether or not
+    anyone has set the secrets up yet, and a job that fails nightly and sends a
+    failure notice for a feature nobody has switched on is worse than no feature:
+    it trains the owner to ignore the one channel that is supposed to mean
+    something. The archive in process.py is inert the same way, so the two agree.
+    """
+    return all(env(name) for name in (
+        "R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"))
+
+
 def client():
     import boto3
     from botocore.config import Config
@@ -215,6 +229,13 @@ def main() -> int:
         # partial answer that looks like a complete one.
         now_local = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) + dt.timedelta(hours=offset)
         day = now_local.date() - dt.timedelta(days=1)
+
+    if not configured():
+        # Deliberately silent on Telegram. See configured().
+        print("the transcript archive is not configured, so there is nothing to compile")
+        print("set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_BUCKET")
+        print("as repository secrets, and the archive in process.py will start filling it")
+        return 0
 
     start, end = window(day, offset)
     print(f"day {day} (local UTC{offset:+d}) -> UTC {start:%Y-%m-%d %H:%M} .. {end:%Y-%m-%d %H:%M}")
