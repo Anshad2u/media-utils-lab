@@ -157,6 +157,28 @@ def number(metrics: dict, name: str) -> float:
         return 0.0
 
 
+def speech_seconds(metrics: dict) -> float:
+    """The speech found, preferring the figure that excludes the padding.
+
+    `speech_s` is the length of the audio file written, and that file is longer
+    than the speech inside it: every run is padded by SEGMENT_PAD_S at both ends
+    and a JOIN_GAP_S gap goes between them. On the first measured day that was
+    91.5 min of "speech" against 81.1 min actually found, so a digest summing
+    `speech_s` was overstating by more than ten percent. Records written before
+    `speech_voiced_s` existed carry only the written length, so they fall back to
+    it rather than reading as zero - a slightly high number for the earliest day
+    beats a hole in the series.
+    """
+    voiced = number(metrics, "speech_voiced_s")
+    return voiced if voiced > 0 else number(metrics, "speech_s")
+
+
+def voice_seconds(metrics: dict) -> float:
+    """The matched speech, on the same basis as speech_seconds."""
+    voiced = number(metrics, "voice_voiced_s")
+    return voiced if voiced > 0 else number(metrics, "voice_s")
+
+
 def build(day: dt.date, offset: int, entries: list[dict]) -> tuple[str, dict]:
     totals = {"recorded": 0.0, "speech": 0.0, "voice": 0.0, "chars": 0}
     per_hour: dict[int, float] = {}
@@ -166,8 +188,8 @@ def build(day: dt.date, offset: int, entries: list[dict]) -> tuple[str, dict]:
         local = entry["stamp"] + dt.timedelta(hours=offset)
         metrics = entry["metrics"]
         recorded = number(metrics, "recorded_s")
-        speech = number(metrics, "speech_s")
-        voice = number(metrics, "voice_s")
+        speech = speech_seconds(metrics)
+        voice = voice_seconds(metrics)
         chars = int(number(metrics, "chars"))
 
         totals["recorded"] += recorded
@@ -289,7 +311,7 @@ def main() -> int:
             metrics = entry["metrics"]
             print(f"  {entry['stamp']:%H:%M:%S}Z  {len(entry['text']):>7} chars  "
                   f"recorded {number(metrics, 'recorded_s'):.0f}s  "
-                  f"voice {number(metrics, 'voice_s'):.0f}s")
+                  f"voice {voice_seconds(metrics):.0f}s")
 
         document, totals = build(day, offset, entries)
 

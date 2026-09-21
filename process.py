@@ -108,6 +108,16 @@ LANGUAGE_CANDIDATES = ("ar", "en")
 # Real speech lands at -0.58 and above, Beary below. The ranges still overlap, so
 # this is a starting point fitted to six chunks, not a settled value. Every
 # candidate score is logged per chunk precisely so the next run can do better.
+#
+# A second calibration on 2026-09-21 added the two readings that matter most,
+# because both come from audio the identifier could not name at all:
+#   Hindi news        ar -0.40, en -0.54
+#   Quranic Arabic    ar -0.25, en -0.52
+# Note what those do NOT justify: raising this floor. -0.40 sits above Beary's
+# -0.50, so any floor high enough to reject the forced Arabic would also reject
+# genuine English at -0.58 and readmit -0.50 Beary. This number cannot separate
+# those cases and was never going to; the defect was in how the readings that
+# cleared it were then chosen, which is fixed in decide_chunk. The value stays.
 LANGUAGE_FLOOR = -0.45
 SILENCE_CEILING = 0.60  # no_speech_prob above this means there was nothing to read
 REPETITION_FLOOR = 0.40  # unique-word ratio below this means the model was looping
@@ -132,6 +142,10 @@ MIN_LID_S = 1.0
 # log to say the vote had been a coin toss between two non-answers.
 LID_MASS_FLOOR = 0.25
 LANGUAGE_BUCKETS = {"ar": "Arabic", "en": "English"}
+# The candidate whose reading does not require the model to leave the language it
+# handles best, and therefore the only one allowed to win on score alone when the
+# acoustics name nothing. See decide_chunk for the two runs that settled it.
+DEFAULT_LANGUAGE = "en"
 OTHER_BUCKET = "Beary / other"
 
 # A Thai sample that ships with the language model. The self-test classifies it
@@ -633,10 +647,14 @@ def decide_chunk(keys: list[str], samples: np.ndarray, preferred: str | None = N
     transcriptions of the same audio: one is a transcription and the other is a
     rendering, and the rendering can outscore it. On a chunk holding two
     languages the comparison then picks the wrong one with confidence - which is
-    how a sentence spoken in English came back as Arabic. The floor still decides
-    whether any candidate fits at all, so "other" is unaffected; falling back to
-    the most confident reading when the acoustics name no survivor keeps this a
-    tie-break rather than a takeover.
+    how a sentence spoken in English came back as Arabic.
+
+    So a label needs support from something other than the score. Either the
+    acoustics name that language, or - when they name nothing at all - it is the
+    default language, whose reading is the one the model was not pushed into.
+    Anything else is left as "other". The floor still decides whether any
+    candidate fits in the first place, so a genuinely unrecognisable recording
+    still lands in "other" exactly as before.
     """
     readings: list[tuple[str, float, str]] = []
     for code in LANGUAGE_CANDIDATES:
@@ -668,8 +686,39 @@ def decide_chunk(keys: list[str], samples: np.ndarray, preferred: str | None = N
     fits = [item for item in readings if item[1] >= LANGUAGE_FLOOR]
     if not fits:
         return OTHER_BUCKET, None, ""
-    code, _, text = next((item for item in fits if item[0] == preferred), fits[0])
-    return LANGUAGE_BUCKETS[code], code, text
+
+    # Which language may be asserted, now that at least one reading fits.
+    #
+    # This used to be `next((item for item in fits if item[0] == preferred),
+    # fits[0])` - the acoustics' pick if it had one, otherwise the most confident
+    # reading. The `fits[0]` half was the bug, and it was not an edge case: the
+    # identifier only ever has a preference when it hears Arabic or English, and
+    # most of this owner's audio is neither, so the fallback was the *normal*
+    # path. It is also the one path where "most confident" is systematically the
+    # wrong answer, because the confident reading is the forced one. Two runs
+    # from 2026-09-21 settle it, both with the identifier naming nothing:
+    #
+    #   Hindi news        ar -0.40   en -0.54   -> asserted Arabic, wrongly
+    #   Quranic Arabic    ar -0.25   en -0.52   -> asserted Arabic, rightly
+    #
+    # The score cannot separate those two, and no floor can either: the false
+    # Arabic sits above the genuine Beary (-0.50, -0.73) that the floor exists to
+    # keep out. What does separate them is which reading had to be forced. So the
+    # acoustics may assert their own language, the default language may assert
+    # itself, and nothing else is asserted at all - a chunk whose language cannot
+    # be established is better labelled "other" than labelled wrongly, because the
+    # label is what the reader trusts and a wrong one costs more than a blank.
+    #
+    # The cost is real and worth stating: a recording that really is Arabic, with
+    # the acoustics declining to say so, now reads as "other" instead of Arabic.
+    # On this owner's audio that is background recitation rather than their own
+    # speech, so it is the cheaper of the two errors - but it is an error, and the
+    # "chunk acoustics" line in the log is what would show it happening.
+    allowed = preferred if preferred is not None else DEFAULT_LANGUAGE
+    chosen = next((item for item in fits if item[0] == allowed), None)
+    if chosen is None:
+        return OTHER_BUCKET, None, ""
+    return LANGUAGE_BUCKETS[chosen[0]], chosen[0], chosen[2]
 
 
 def load_lid():
@@ -947,6 +996,21 @@ def render(samples: np.ndarray, runs: list[tuple[float, float]], destination: Pa
     return len(joined) / SAMPLE_RATE
 
 
+def voiced_seconds(runs: list[tuple[float, float]]) -> float:
+    """How much speech the runs hold, with no padding and no joins.
+
+    `render` returns the length of the file it wrote, and that file is longer
+    than the speech inside it: every run is padded by SEGMENT_PAD_S at both ends
+    and a JOIN_GAP_S gap is inserted between consecutive pieces. On a day of
+    short runs the difference is double-digit percent, and every caption was
+    quoting the written length as "N s of speech" - 91.5 min reported against
+    81.1 min actually found, on the day this was measured. The two figures are
+    now kept apart instead of one standing in for the other: this is the speech,
+    `render`'s return value is the file.
+    """
+    return sum(max(0.0, end - start) for start, end in runs)
+
+
 # --------------------------------------------------------------------------- #
 # Enrolment
 # --------------------------------------------------------------------------- #
@@ -1090,11 +1154,15 @@ def minute_map(runs: list[tuple[float, float]],
         index = min(span - 1, max(0, int(start // 60.0)))
         voice[index] += max(0.0, end - start)
 
-    # The caller passes fused runs, which do not overlap, so this should never
-    # bite. Clamp anyway: the two columns come from different lists, and a minute
-    # claiming more of the user's voice than it claims speech is a contradiction
-    # the reader cannot resolve - they cannot tell which column is lying. A
-    # slightly conservative bar is better than a visibly impossible one.
+    # The voice column is summed from the raw matched runs, not from the fused
+    # ones, so both columns measure the same thing - speech found. Fusing pads
+    # every run by SEGMENT_PAD_S at both ends and inserts a join between them,
+    # which made the numerator a file length while the denominator stayed a
+    # speech length, and so read the voice share high by the same margin the
+    # caption was overstating by. A kept run is a window inside a detected run,
+    # so the voice column should still never exceed the speech column; clamp
+    # anyway, because a run is attributed wholly to the minute it starts in and
+    # a run crossing a boundary can land its whole length in one column's minute.
     for index in range(span):
         voice[index] = min(voice[index], speech[index])
 
@@ -1271,6 +1339,7 @@ def process(
         # an automated upload sends no notice for an ordinary result. That is the
         # one case "include everything" must not lose.
         whole_seconds = render(samples, fuse(runs, total_s), all_wav)
+        whole_speech = voiced_seconds(runs)
         whole_ok = whole_seconds > 0 and encode(all_wav, all_out)
         if not whole_ok:
             log.warning("full audio could not be built")
@@ -1279,12 +1348,15 @@ def process(
         # rather than a fault: the full recording still goes out below.
         merged: list[tuple[float, float]] = []
         kept_seconds = 0.0
+        kept_speech = 0.0
         if kept:
             merged = fuse(kept, total_s)
             kept_seconds = render(samples, merged, joined)
+            kept_speech = voiced_seconds(kept)
             if kept_seconds <= 0 or not encode(joined, output):
                 log.warning("kept audio could not be built; sending the full audio only")
                 kept_seconds = 0.0
+                kept_speech = 0.0
         else:
             log.info("no run matched the reference voice")
 
@@ -1313,7 +1385,7 @@ def process(
 
         if kept_seconds > 0:
             caption = (
-                f"original {original:.1f}s | kept {kept_seconds:.1f}s | "
+                f"original {original:.1f}s | kept {kept_speech:.1f}s | "
                 f"{len(merged)} segment(s) | threshold {threshold:.2f}{mix_line}"
             )
         else:
@@ -1321,7 +1393,7 @@ def process(
             # and on a recording where nobody matched the reference it is not one.
             caption = (
                 f"original {original:.1f}s | no voice match | "
-                f"{whole_seconds:.1f}s of speech | threshold {threshold:.2f}{mix_line}"
+                f"{whole_speech:.1f}s of speech | threshold {threshold:.2f}{mix_line}"
             )
 
         if kind == "document":
@@ -1353,8 +1425,15 @@ def process(
                 # Without it there is no way to tell a transcript that worked from
                 # one that never ran - both leave the log identical, and the run at
                 # 02:22 could not be checked either way for exactly that reason.
-                log.info("full transcript: %d char(s) over %.1f s of speech",
-                         len(whole), whole_seconds)
+                # Two figures, kept apart on purpose. The file written is longer
+                # than the speech inside it - SEGMENT_PAD_S at both ends of every
+                # run, JOIN_GAP_S between them - and quoting that file length as
+                # "of speech" is what overstated every caption on the day this was
+                # measured: 91.5 min reported against 81.1 min found. The sidecar
+                # below carries both, and the backfill reads them from this line.
+                log.info("full transcript: %d char(s) over %.1f s of audio written, "
+                         "%.1f s of speech found in %d run(s)",
+                         len(whole), whole_seconds, whole_speech, len(runs))
 
             if whole:
                 # A document rather than a message: Telegram caps a message at
@@ -1365,14 +1444,25 @@ def process(
                 # text: where the recording was loud, and which parts of it were
                 # actually the voice this pipeline is looking for. Empty when the
                 # recording had no runs, hence the guard rather than a stray blank.
-                profile = minute_map(runs, merged, total_s)
-                document = (
-                    f"{profile}\n{whole}\n\n" if profile else f"{whole}\n\n"
-                    f"---\n"
-                    f"sampled chunks, with the language each was read as. The full\n"
-                    f"transcript above carries no per-line label.\n\n"
-                    f"{transcript}\n"
-                )
+                profile = minute_map(runs, kept, total_s)
+                # Assembled in steps rather than as one conditional expression.
+                # It used to read `f"{profile}..." if profile else f"..."` followed
+                # by more adjacent string literals, and implicit concatenation
+                # binds tighter than a conditional - so everything after the
+                # `else` was swallowed into the else branch, and any recording
+                # with at least one run silently shipped without its census. The
+                # feature was written, committed and never once delivered.
+                document = f"{profile}\n{whole}\n\n" if profile else f"{whole}\n\n"
+                if transcript:
+                    # Guarded rather than appended unconditionally: with no
+                    # readable chunks the header would otherwise trail the
+                    # transcript as a heading with nothing beneath it.
+                    document += (
+                        f"---\n"
+                        f"sampled chunks, with the language each was read as. The full\n"
+                        f"transcript above carries no per-line label.\n\n"
+                        f"{transcript}\n"
+                    )
                 text_out.write_text(document, encoding="utf-8")
                 # Archived before it is sent, and from the same string that is
                 # written to the file, so the private copy is byte-identical to
@@ -1380,9 +1470,18 @@ def process(
                 archive_transcript(
                     document,
                     {
+                        # Two durations per track, because they answer different
+                        # questions and only one of them is speech. `speech_s` and
+                        # `voice_s` are the lengths of the two files written - what
+                        # a size question wants. `speech_voiced_s` and
+                        # `voice_voiced_s` are the speech the detector actually
+                        # found - what "how much did I talk" wants. Until now these
+                        # were one number wearing one name, and the name said speech.
                         "recorded_s": f"{original:.1f}",
                         "speech_s": f"{whole_seconds:.1f}",
+                        "speech_voiced_s": f"{whole_speech:.1f}",
                         "voice_s": f"{kept_seconds:.1f}",
+                        "voice_voiced_s": f"{kept_speech:.1f}",
                         "chars": len(whole),
                         "segments": len(merged),
                         "threshold": f"{threshold:.2f}",
