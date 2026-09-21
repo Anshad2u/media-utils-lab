@@ -80,6 +80,15 @@ jobs:
           TRANSCRIBE: ${{ vars.TRANSCRIBE }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GROQ_API_KEY_2: ${{ secrets.GROQ_API_KEY_2 }}
+          # The private transcript archive. Optional: with none of these set,
+          # archive_transcript() returns immediately and the run is unchanged.
+          # All four are secrets rather than variables so the runner masks them -
+          # the account id is not a credential, but it is the hostname of the
+          # bucket endpoint, and it has no business in a world-readable log.
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
           # The dispatch payload is read from the event file, never from here.
           # The runner echoes every env value into the public log, and the
           # payload carries the file id.

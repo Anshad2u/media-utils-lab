@@ -1123,6 +1123,79 @@ def minute_map(runs: list[tuple[float, float]],
     return "\n".join(lines) + "\n"
 
 
+# --------------------------------------------------------------------------- #
+# Archive
+# --------------------------------------------------------------------------- #
+
+def archive_transcript(text: str, metrics: dict, stamp: float) -> None:
+    """Copy one transcript into the private archive, when one is configured.
+
+    Optional on purpose, and completely inert without configuration. The
+    pipeline's job is to deliver the recording, so a missing bucket, a wrong key
+    or a bad network must never cost the user their audio or their transcript.
+    Every failure here is therefore logged and swallowed.
+
+    This exists because delivery is not storage. The transcripts go out over
+    Telegram, and a bot cannot read back the messages it sent: getUpdates carries
+    incoming updates only, and the Bot API has no get-history method. The runner
+    is destroyed when the job ends. So without this the text exists for a few
+    minutes and then nowhere at all - which is exactly why "give me today's
+    transcript" could not be answered for a day that had already passed.
+
+    Keys are UTC. The digest applies the local offset when it reads, so the day
+    boundary is decided in one place and can be changed later without rewriting
+    anything already stored.
+
+    Nothing here is safe to print, so nothing is printed: not the text, not the
+    key, not the bucket, not the endpoint. Only a character count.
+    """
+    account = os.environ.get("R2_ACCOUNT_ID", "").strip()
+    key_id = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+    secret = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
+    bucket = os.environ.get("R2_BUCKET", "").strip()
+    if not (account and key_id and secret and bucket):
+        return
+
+    try:
+        import boto3
+        from botocore.config import Config
+    except Exception as error:
+        log.warning("archive skipped: %s", describe(error))
+        return
+
+    moment = time.gmtime(stamp)
+    # The run id separates two recordings processed inside the same second, which
+    # happens when a burst clears the queue quickly.
+    run = os.environ.get("GITHUB_RUN_ID", "").strip() or str(int(stamp))
+    key = (f"transcripts/{time.strftime('%Y-%m-%d', moment)}/"
+           f"{time.strftime('%H%M%S', moment)}-{run}.txt")
+
+    try:
+        client = boto3.client(
+            "s3",
+            endpoint_url=f"https://{account}.r2.cloudflarestorage.com",
+            aws_access_key_id=key_id,
+            aws_secret_access_key=secret,
+            region_name="auto",
+            config=Config(retries={"max_attempts": 3, "mode": "standard"},
+                          connect_timeout=10, read_timeout=20),
+        )
+        client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=text.encode("utf-8"),
+            ContentType="text/plain; charset=utf-8",
+            # Read back by the digest to total the day without downloading every
+            # object. S3 metadata is not typed and travels in headers, so every
+            # value is a string and every key is plain ascii. No file name is
+            # stored: it comes from Telegram and nothing here needs it.
+            Metadata={name: str(value) for name, value in metrics.items()},
+        )
+        log.info("archived transcript: %d char(s)", len(text))
+    except Exception as error:
+        log.warning("archive failed: %s", describe(error))
+
+
 def process(
     token: str,
     chat_id: str,
@@ -1315,13 +1388,28 @@ def process(
                 # actually the voice this pipeline is looking for. Empty when the
                 # recording had no runs, hence the guard rather than a stray blank.
                 profile = minute_map(runs, merged, total_s)
-                text_out.write_text(
+                document = (
                     f"{profile}\n{whole}\n\n" if profile else f"{whole}\n\n"
                     f"---\n"
                     f"sampled chunks, with the language each was read as. The full\n"
                     f"transcript above carries no per-line label.\n\n"
-                    f"{transcript}\n",
-                    encoding="utf-8",
+                    f"{transcript}\n"
+                )
+                text_out.write_text(document, encoding="utf-8")
+                # Archived before it is sent, and from the same string that is
+                # written to the file, so the private copy is byte-identical to
+                # the delivered one rather than a second rendering of it.
+                archive_transcript(
+                    document,
+                    {
+                        "recorded_s": f"{original:.1f}",
+                        "speech_s": f"{whole_seconds:.1f}",
+                        "voice_s": f"{kept_seconds:.1f}",
+                        "chars": len(whole),
+                        "segments": len(merged),
+                        "threshold": f"{threshold:.2f}",
+                    },
+                    time.time(),
                 )
                 if not send_document(token, chat_id, text_out, caption,
                                     transcript_name(file_name), "text/plain"):
